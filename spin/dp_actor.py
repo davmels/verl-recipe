@@ -77,7 +77,11 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
             with torch.no_grad():
-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+                output = self._forward_micro_batch(micro_batch, temperature=temperature)
+                if isinstance(output, dict):
+                    log_probs = output["log_probs"]
+                else:
+                    _, log_probs = output
             log_probs_lst.append(log_probs)
         log_probs = torch.concat(log_probs_lst, dim=0)
 

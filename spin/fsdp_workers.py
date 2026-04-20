@@ -81,6 +81,7 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
     def init_model(self):
         from recipe.spin.dp_actor import SPINDataParallelPPOActor as DataParallelPPOActor
 
+        self._qat_enabled = False
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
@@ -165,6 +166,23 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
                 checkpoint_config=self.config.actor.checkpoint,
             )
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_ref_model_weights(self, local_path):
+        """Load model-only weights into the ref model from a checkpoint saved by the actor."""
+        assert self._is_ref, "load_ref_model_weights requires a ref worker"
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
+        from torch.distributed.fsdp.api import ShardedStateDictConfig
+
+        from verl.utils.checkpoint.fsdp_checkpoint_manager import get_fsdp_state_ctx
+
+        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+        with get_fsdp_state_ctx(self.ref_module_fsdp, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, None):
+            model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+            model_state_dict = torch.load(model_path, weights_only=False)
+            self.ref_module_fsdp.load_state_dict(model_state_dict)
+        torch.distributed.barrier()
+        print(f"[Rank {self.rank}] Loaded ref model weights from {local_path}")
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
@@ -185,7 +203,7 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
+        if self.world_size > 1 and self.ref_policy.actor_module._handle.uses_sharded_strategy:
             self.ref_policy.actor_module._handle.reshard(True)
 
         return output
@@ -214,7 +232,7 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
+        if self.world_size > 1 and self.actor.actor_module._handle.uses_sharded_strategy:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -263,7 +281,9 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics["perf/mfu/actor"] = estimated_flops * self.config.ppo_epochs / promised_flops / self.world_size
+            metrics["perf/mfu/actor"] = (
+                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            )
 
             # --- LR Scheduler Step ---
             lr = self.actor_lr_scheduler.get_last_lr()[0]
@@ -592,7 +612,8 @@ class RewardModelWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        self.reward_module._handle.reshard(True)
+        if self.reward_module._handle.uses_sharded_strategy:
+            self.reward_module._handle.reshard(True)
 
         output = output.to("cpu")
         return output

@@ -40,9 +40,77 @@ from verl.trainer.ppo.metric_utils import compute_throughout_metrics, compute_ti
 from verl.trainer.ppo.utils import Role, WorkerType, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, postprocess_data
 from verl.utils.tracking import ValidationGenerationsLogger
+
+
+def make_spin_collate_fn(tokenizer, max_prompt_length: int, truncation: str = "error"):
+    """
+    Latest verl's RLHFDataset.__getitem__ no longer tokenizes — it returns only
+    `raw_prompt` (chat messages) + `dummy_tensor`. The spin recipe still expects
+    `input_ids`/`attention_mask`/`position_ids` in the batch, so we tokenize here.
+    """
+
+    def _collate(data_list: list[dict]) -> dict:
+        tensors = defaultdict(list)
+        non_tensors = defaultdict(list)
+
+        batch_input_ids = []
+        batch_attention_mask = []
+        raw_prompt_ids_list = []
+
+        for data in data_list:
+            messages = data["raw_prompt"]
+            prompt_text = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            tokenized = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+            input_ids = tokenized["input_ids"]
+            attention_mask = tokenized["attention_mask"]
+
+            raw_prompt_ids_list.append(input_ids[0].tolist())
+
+            input_ids, attention_mask = postprocess_data(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_length=max_prompt_length,
+                pad_token_id=tokenizer.pad_token_id,
+                left_pad=True,
+                truncation=truncation,
+            )
+            batch_input_ids.append(input_ids[0])
+            batch_attention_mask.append(attention_mask[0])
+
+            for key, val in data.items():
+                if key in ("raw_prompt", "dummy_tensor"):
+                    continue
+                if isinstance(val, torch.Tensor):
+                    tensors[key].append(val)
+                else:
+                    non_tensors[key].append(val)
+
+        input_ids = torch.stack(batch_input_ids, dim=0)
+        attention_mask = torch.stack(batch_attention_mask, dim=0)
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        for key, val in tensors.items():
+            tensors[key] = torch.stack(val, dim=0)
+
+        tensors["input_ids"] = input_ids
+        tensors["attention_mask"] = attention_mask
+        tensors["position_ids"] = position_ids
+
+        non_tensors["raw_prompt_ids"] = raw_prompt_ids_list
+        non_tensors["raw_prompt"] = [d["raw_prompt"] for d in data_list]
+
+        for key, val in non_tensors.items():
+            non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
+
+        return {**tensors, **non_tensors}
+
+    return _collate
 
 
 @dataclass
@@ -109,77 +177,42 @@ class ResourcePoolManager:
 
 
 def _compute_response_info(batch: DataProto) -> dict[str, Any]:
-    """Placeholder: Computes prompt and response lengths."""
-    try:
-        # Assuming 'prompts' and 'responses' keys exist after generation/union
-        prompt_len = batch.batch["prompts"].shape[1]
-        resp_len = batch.batch["responses"].shape[1]
-        # This is simplified - real implementation might use attention masks
-        # to get actual lengths per sample.
-        batch_size = batch.batch.batch_size[0]
-        prompt_lengths_tensor = torch.full((batch_size,), prompt_len, dtype=torch.float32, device=batch.batch.device)
-        response_lengths_tensor = torch.full((batch_size,), resp_len, dtype=torch.float32, device=batch.batch.device)
+    """Computes actual (unpadded) prompt and response lengths from masks."""
+    batch_size = batch.batch.batch_size[0]
+    device = batch.batch.device
 
-        # Try getting actual lengths from attention mask if possible (more accurate)
-        if "response_mask" in batch.batch:
-            response_lengths_tensor = batch.batch["response_mask"].sum(dim=1).float()
-            # if "attention_mask" in batch.batch and "response_mask" in batch.batch:
-            # full_mask = batch.batch["attention_mask"]
-            # resp_mask = batch.batch["response_mask"]
-            # Infer prompt mask length based on where response mask starts or total length
-            # This logic depends heavily on how your masks are constructed.
-            # Example: prompt_lengths_tensor = full_mask.sum(dim=1).float() - response_lengths_tensor
-            # Fallback to using prompt shape if mask logic is complex:
-            prompt_lengths_tensor = torch.tensor(
-                [batch.batch["prompts"].shape[1]] * batch_size, dtype=torch.float32, device=batch.batch.device
-            )
+    response_lengths_tensor = batch.batch["response_mask"].sum(dim=1).float()
+    total_lengths = batch.batch["attention_mask"].sum(dim=1).float()
+    prompt_lengths_tensor = total_lengths - response_lengths_tensor
 
-        return {
-            "prompt_length": prompt_lengths_tensor,
-            "response_length": response_lengths_tensor,
-            "max_response_length": resp_len,
-            "max_prompt_length": prompt_len,  # Or from config if fixed padding
-        }
-    except KeyError as e:
-        print(f"Warning: Missing key in _compute_response_info: {e}. Returning defaults.")
-        # Return default/dummy values if keys are missing
-        b_size = batch.batch.batch_size[0] if batch.batch.batch_size else 1
-        max_resp = batch.batch.get("responses").shape[1] if batch.batch.get("responses") is not None else 0
-        max_prompt = batch.batch.get("prompts").shape[1] if batch.batch.get("prompts") is not None else 0
-        return {
-            "prompt_length": torch.zeros(b_size),
-            "response_length": torch.zeros(b_size),
-            "max_response_length": max_resp,
-            "max_prompt_length": max_prompt,
-        }
+    max_response_length = batch.batch["responses"].shape[1]
+    max_prompt_length = batch.batch["prompts"].shape[1]
+
+    return {
+        "prompt_length": prompt_lengths_tensor,
+        "response_length": response_lengths_tensor,
+        "max_response_length": max_response_length,
+        "max_prompt_length": max_prompt_length,
+    }
 
 
 # --- Modified Metric Function ---
 def compute_dpo_data_metrics(batch: DataProto) -> dict[str, Any]:
     """
-    Computes and returns metrics relevant for the DPO-like process.
-    Assumes 'batch' contains results after generation and preference marking,
-    potentially including 'dpo_logits', 'preferences', 'chosen_logps', etc.
-    Removes PPO-specific advantage/return/critic metrics.
+    Computes metrics from the generation batch: reward scores and sequence lengths.
+    DPO-specific metrics (loss, logprobs, accuracies) come from actor_output and
+    are merged separately via reduce_metrics at the call site.
     """
-    print("---- [DEBUG] Computing DPO Data Metrics ----")
     metrics = {}
     try:
-        # --- Scores and Rewards (from reward_fn) ---
-        if "token_level_scores" in batch.batch and batch.batch["token_level_scores"] is not None:
-            sequence_score = batch.batch["token_level_scores"].sum(-1)
-            metrics.update(
-                {
-                    "reward/score/mean": torch.mean(sequence_score).item(),
-                    "reward/score/max": torch.max(sequence_score).item(),
-                    "reward/score/min": torch.min(sequence_score).item(),
-                }
-            )
-        else:
-            print("DEBUG compute_dpo_data_metrics: 'token_level_scores' not found.")
-
+        # --- Rewards (from reward_fn, stored as token_level_rewards) ---
         if "token_level_rewards" in batch.batch and batch.batch["token_level_rewards"] is not None:
-            sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+            response_mask = batch.batch.get("response_mask")
+            token_rewards = batch.batch["token_level_rewards"]
+            if response_mask is not None:
+                sequence_reward = (token_rewards * response_mask).sum(-1)
+            else:
+                sequence_reward = token_rewards.sum(-1)
             metrics.update(
                 {
                     "reward/rewards/mean": torch.mean(sequence_reward).item(),
@@ -187,38 +220,58 @@ def compute_dpo_data_metrics(batch: DataProto) -> dict[str, Any]:
                     "reward/rewards/min": torch.min(sequence_reward).item(),
                 }
             )
-        else:
-            print("DEBUG compute_dpo_data_metrics: 'token_level_rewards' not found.")
 
-        # --- DPO Specific Metrics (if stored previously) ---
-        if "dpo_logits" in batch.batch and batch.batch["dpo_logits"] is not None:
-            metrics["actor/dpo_logits"] = batch.batch["dpo_logits"].mean().item()
-        else:
-            print("DEBUG compute_dpo_data_metrics: 'dpo_logits' not found.")
+        # --- Preference accuracy from reward scores ---
+        if "preferences" in batch.batch and batch.batch["preferences"] is not None:
+            preferences = batch.batch["preferences"]
+            n_pairs = preferences.sum().item()
+            n_total = preferences.shape[0] // 2 if preferences.shape[0] > 0 else 0
+            if n_total > 0:
+                metrics["reward/preference_pairs"] = float(n_total)
 
-        if "chosen_logps" in batch.batch and batch.batch["chosen_logps"] is not None:
-            metrics["actor/chosen_logps"] = batch.batch["chosen_logps"].mean().item()
-        else:
-            print("DEBUG compute_dpo_data_metrics: 'chosen_logps' not found.")
+        # --- Ref log prob stats (token-level, before splitting into chosen/rejected) ---
+        if "ref_log_prob" in batch.batch and batch.batch["ref_log_prob"] is not None:
+            response_mask = batch.batch.get("response_mask")
+            ref_lp = batch.batch["ref_log_prob"]
+            if response_mask is not None:
+                ref_seq_logps = (ref_lp * response_mask).sum(-1)
+            else:
+                ref_seq_logps = ref_lp.sum(-1)
+            metrics["ref/seq_logprob/mean"] = torch.mean(ref_seq_logps).item()
 
-        if "rejected_logps" in batch.batch and batch.batch["rejected_logps"] is not None:
-            metrics["actor/rejected_logps"] = batch.batch["rejected_logps"].mean().item()
-        else:
-            print("DEBUG compute_dpo_data_metrics: 'rejected_logps' not found.")
+        # --- Policy log prob stats (old_log_probs from the current policy snapshot) ---
+        if "old_log_probs" in batch.batch and batch.batch["old_log_probs"] is not None:
+            response_mask = batch.batch.get("response_mask")
+            old_lp = batch.batch["old_log_probs"]
+            if response_mask is not None:
+                policy_seq_logps = (old_lp * response_mask).sum(-1)
+            else:
+                policy_seq_logps = old_lp.sum(-1)
+            metrics["policy/seq_logprob/mean"] = torch.mean(policy_seq_logps).item()
 
-        # Add metrics based on the 'preferences' mask if available
-        # if "preferences" in batch.batch and batch.batch["preferences"] is not None:
-        # prefs_mask = batch.batch["preferences"]  # Shape [batch_size * n]
-        # Calculate accuracy based on RM scores (assuming higher score -> True in mask)
-        # Requires chosen/rejected scores to be available or recalculated
-        # This is complex here, better calculated in the main loop or update function
+        # --- KL divergence between policy and ref (if both available) ---
+        if (
+            "old_log_probs" in batch.batch
+            and "ref_log_prob" in batch.batch
+            and batch.batch["old_log_probs"] is not None
+            and batch.batch["ref_log_prob"] is not None
+        ):
+            response_mask = batch.batch.get("response_mask")
+            kl = batch.batch["old_log_probs"] - batch.batch["ref_log_prob"]
+            if response_mask is not None:
+                kl_masked = kl * response_mask
+                kl_per_seq = kl_masked.sum(-1) / response_mask.sum(-1).clamp(min=1)
+            else:
+                kl_per_seq = kl.mean(-1)
+            metrics["kl/policy_vs_ref/mean"] = torch.mean(kl_per_seq).item()
+            metrics["kl/policy_vs_ref/max"] = torch.max(kl_per_seq).item()
 
         # --- Length Metrics ---
         response_info = _compute_response_info(batch)
         prompt_length = response_info["prompt_length"]
         response_length = response_info["response_length"]
         max_response_length = response_info["max_response_length"]
-        max_prompt_length = response_info["max_prompt_length"]  # Use calculated or from config
+        max_prompt_length = response_info["max_prompt_length"]
 
         metrics.update(
             {
@@ -229,7 +282,6 @@ def compute_dpo_data_metrics(batch: DataProto) -> dict[str, Any]:
                 "prompt_length/mean": torch.mean(prompt_length).item(),
                 "prompt_length/max": torch.max(prompt_length).item(),
                 "prompt_length/min": torch.min(prompt_length).item(),
-                # Prompt clip ratio might need adjustment based on how max_prompt_length is defined
                 "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).item(),
             }
         )
@@ -240,7 +292,6 @@ def compute_dpo_data_metrics(batch: DataProto) -> dict[str, Any]:
         print(f"ERROR in compute_dpo_data_metrics: {e}")
         traceback.print_exc()
 
-    print(f"---- [DEBUG] Calculated DPO Data Metrics: {list(metrics.keys())} ----")
     return metrics
 
 
@@ -365,8 +416,8 @@ class RaySPINTrainer:
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = need_reference_policy(role_worker_mapping)
-        self.use_rm = need_reward_model(role_worker_mapping)
+        self.use_reference_policy = True #need_reference_policy(role_worker_mapping)
+        self.use_rm = False #need_reward_model(role_worker_mapping)
         self.use_critic = False
         self.ray_worker_group_cls = ray_worker_group_cls
         self.validation_generations_logger = ValidationGenerationsLogger()
@@ -408,9 +459,11 @@ class RaySPINTrainer:
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-
-            collate_fn = default_collate_fn
+            collate_fn = make_spin_collate_fn(
+                tokenizer=self.tokenizer,
+                max_prompt_length=self.config.data.max_prompt_length,
+                truncation=self.config.data.get("truncation", "error"),
+            )
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
@@ -691,6 +744,19 @@ class RaySPINTrainer:
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
 
+        # Latest verl deprecated sync rollout. actor_rollout_wg.generate_sequences()
+        # calls rollout.resume() which looks up a `sglang_server_*` ray actor that is
+        # only created by AgentLoopManager. So always create it and route gen through it.
+        from verl.experimental.agent_loop import AgentLoopManager
+
+        actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+        self.async_rollout_manager = AgentLoopManager.create(
+            config=self.config,
+            worker_group=self.actor_rollout_wg,
+            rollout_resource_pool=actor_rollout_resource_pool,
+        )
+        self.async_rollout_mode = True
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(
@@ -928,22 +994,12 @@ class RaySPINTrainer:
                         ):
                             print(f"\n[Step {self.global_steps}] Updating Reference Model Weights from Actor...")
                             try:
-                                # --- This requires careful implementation with FSDP ---
-                                # 1. Save actor state dict (potentially to CPU memory or disk)
-                                #    This needs to be done collectively across actor worker ranks.
-                                #    The checkpoint_manager might be adaptable, or use FSDP APIs directly.
-                                #    Example placeholder using a conceptual save/load mechanism:
-                                actor_state_path = "/tmp/actor_state_mid"  # Temporary path
-                                self.actor_rollout_wg.save_checkpoint(actor_state_path)  # Adapt save logic
-
-                                # 2. Load the state dict onto the reference model worker group
-                                #    This also needs collective loading on the ref worker ranks.
-                                self.ref_policy_wg.load_checkpoint(actor_state_path, None, True)  # Adapt load logic
-
+                                _scratch = os.environ.get("SCRATCH", "/tmp")
+                                _job_id = os.environ.get("SLURM_JOB_ID", "nojob")
+                                actor_state_path = os.path.join(_scratch, "online_dpo_ckpts", f"actor_state_for_ref_{_job_id}")
+                                self.actor_rollout_wg.save_checkpoint(actor_state_path)
+                                self.ref_policy_wg.load_ref_model_weights(actor_state_path)
                                 print(f"[Step {self.global_steps}] Reference Model Weights Updated.")
-                                # Optionally remove the temporary state file
-                                # os.remove(actor_state_path) # Needs rank-aware removal or shared storage
-
                             except Exception as sync_e:
                                 print(f"ERROR during reference model sync at step {self.global_steps}: {sync_e}")
                                 traceback.print_exc()
@@ -953,6 +1009,8 @@ class RaySPINTrainer:
                         if "position_ids" in batch.batch:
                             pop_batch_keys.append("position_ids")
                         pop_non_tensor_keys = ["raw_prompt_ids"] if "raw_prompt_ids" in batch.non_tensor_batch else []
+                        if "raw_prompt" in batch.non_tensor_batch:
+                            pop_non_tensor_keys.append("raw_prompt")
                         if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                             pop_non_tensor_keys.extend(["multi_modal_data", "multi_modal_inputs"])
                         original_non_tensor_data = batch.non_tensor_batch
@@ -968,7 +1026,10 @@ class RaySPINTrainer:
                         # Generate sequences (chosen/rejected pairs)
                         with _timer("gen", timing_raw):
                             try:
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                                if self.async_rollout_mode:
+                                    gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                else:
+                                    gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                                 # (Add Debug prints for gen_batch_output if needed)
                             except Exception as gen_e:
                                 print(f"\n!!!!!!!! ERROR DURING GENERATION (Step {self.global_steps}) !!!!!!!!")
@@ -985,7 +1046,6 @@ class RaySPINTrainer:
                         )
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)
-                        # (Add Debug prints after union if needed)
 
                         # Compute response mask (needed for ref logprob calc and DPO prep)
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1157,6 +1217,11 @@ class RaySPINTrainer:
                                     dpo_tensors["rejected_position_ids"] = rejected_position_ids
 
                                 # Prepare Meta Info
+                                dpo_global_token_num = (
+                                    torch.cat([chosen_attention_mask, rejected_attention_mask], dim=0)
+                                    .sum(dim=-1)
+                                    .tolist()
+                                )
                                 dpo_meta = {
                                     "dpo_beta": OmegaConf.select(self.config.algorithm, "dpo_beta", default=0.1),
                                     "dpo_loss_type": OmegaConf.select(
@@ -1168,6 +1233,7 @@ class RaySPINTrainer:
                                     "use_reference_policy": self.use_reference_policy,
                                     "reference_free": not self.use_reference_policy,  # False if using external ref
                                     "global_step": self.global_steps,
+                                    "global_token_num": dpo_global_token_num,
                                 }
 
                                 dpo_update_batch_proto = DataProto.from_dict(tensors=dpo_tensors, meta_info=dpo_meta)
@@ -1187,7 +1253,7 @@ class RaySPINTrainer:
                                 # Pass the batch containing reference log probs (if computed)
                                 # The modified update_actor_dpo expects them if reference_free=False
                                 actor_output = self.actor_rollout_wg.update_actor_dpo(dpo_update_batch_proto)
-                            if actor_output and "metrics" in actor_output.meta_info:
+                            if actor_output is not None and "metrics" in actor_output.meta_info:
                                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
                         elif dpo_update_batch_proto is None:
                             print(

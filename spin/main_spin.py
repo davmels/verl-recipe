@@ -37,7 +37,12 @@ def run_ppo(config) -> None:
         # this is for local ray cluster
         ray.init(
             runtime_env={
-                "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true",
+                    "NCCL_DEBUG": "WARN",
+                    "VLLM_LOGGING_LEVEL": "WARN",
+                    **{k: os.environ[k] for k in ("JUDGE_BASE_URL", "JUDGE_API_KEY", "JUDGE_MODEL") if k in os.environ},
+                }
             }
         )
 
@@ -113,7 +118,7 @@ class TaskRunner:
         # validate config
         validate_config(
             config=config,
-            use_reference_policy=need_reference_policy(role_worker_mapping),
+            use_reference_policy=True, #need_reference_policy(role_worker_mapping),
             use_critic=False,
         )
 

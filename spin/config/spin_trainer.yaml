@@ -23,6 +23,11 @@ actor_rollout_ref:
 algorithm:
   adv_estimator: null
 
+reward:
+  custom_reward_function:
+    path: pkg://recipe.spin.active_ultrafeedback_reward
+    name: compute_score
+
 trainer:
   log_val_generations: 0
   ref_update_freq: 1
