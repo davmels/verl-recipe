@@ -14,7 +14,8 @@ _BATCH = {"idx": 0}
 
 _LOG_DIR = "/iopsstor/scratch/cscs/dmelikidze/verl-training/logs"
 os.makedirs(_LOG_DIR, exist_ok=True)
-_LOG_FILE = open(os.path.join(_LOG_DIR, f"reward_pid{os.getpid()}.log"), "a", buffering=1)
+_JOB_ID = os.environ.get("SLURM_JOB_ID", "nojob")
+_LOG_FILE = open(os.path.join(_LOG_DIR, f"reward_job{_JOB_ID}_pid{os.getpid()}.log"), "a", buffering=1)
 
 # Pre-computed scores indexed by position in batch, filled by the hook
 _PRECOMPUTED: dict[int, dict] = {}
@@ -38,9 +39,9 @@ TRUTHFULNESS_ANNOTATION_PROMPT = _prompts.TRUTHFULNESS_ANNOTATION_PROMPT
 HELPFULNESS_ANNOTATION_PROMPT = _prompts.HELPFULNESS_ANNOTATION_PROMPT
 
 ASPECT2ANNOTATION_PROMPT = {
-    "instruction_following": INSTRUCTION_FOLLOWING_ANNOTATION_PROMPT,
-    "honesty": HONESTY_ANNOTATION_PROMPT,
-    "truthfulness": TRUTHFULNESS_ANNOTATION_PROMPT,
+    # "instruction_following": INSTRUCTION_FOLLOWING_ANNOTATION_PROMPT,
+    # "honesty": HONESTY_ANNOTATION_PROMPT,
+    # "truthfulness": TRUTHFULNESS_ANNOTATION_PROMPT,
     "helpfulness": HELPFULNESS_ANNOTATION_PROMPT,
 }
 
@@ -84,7 +85,8 @@ def _extract_probabilities(res) -> dict[str, float]:
 
 
 async def _judge_aspect(
-    client: AsyncOpenAI, model: str, aspect: str, formatted_input: str, completion: str, call_id: int
+    client: AsyncOpenAI, model: str, aspect: str, formatted_input: str, completion: str, call_id: int,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> dict[str, float]:
     user_prompt = ASPECT2ANNOTATION_PROMPT[aspect].format(prompt=formatted_input, completion=completion)
     messages = [
@@ -93,15 +95,27 @@ async def _judge_aspect(
     ]
     t0 = time.monotonic()
     try:
-        res = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=1,
-            temperature=0.0,
-            logprobs=True,
-            top_logprobs=20,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
+        if semaphore is not None:
+            async with semaphore:
+                res = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=1,
+                    temperature=0.0,
+                    logprobs=True,
+                    top_logprobs=20,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                )
+        else:
+            res = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=1,
+                temperature=0.0,
+                logprobs=True,
+                top_logprobs=20,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
     except Exception as e:
         _log(f"call#{call_id} aspect={aspect} FAILED after {time.monotonic() - t0:.2f}s: {type(e).__name__}: {e}")
         return {w: 0.0 for w in TARGET_TOKENS}
@@ -112,7 +126,8 @@ async def _judge_aspect(
 async def _score_batch_async(items: list[dict]) -> list[dict]:
     """Score all items concurrently in a single event loop."""
     timeout = httpx.Timeout(60.0)
-    limits = httpx.Limits(max_connections=1000, max_keepalive_connections=100)
+    limits = httpx.Limits(max_connections=512, max_keepalive_connections=100)
+    semaphore = asyncio.Semaphore(512)
     async with httpx.AsyncClient(timeout=timeout, limits=limits) as http_client:
         client = AsyncOpenAI(
             base_url=items[0]["base_url"],
@@ -127,6 +142,7 @@ async def _score_batch_async(items: list[dict]) -> list[dict]:
                     _judge_aspect(
                         client, item["model"], aspect,
                         item["formatted_input"], item["completion"], item["call_id"],
+                        semaphore=semaphore,
                     )
                 )
                 task_index.append((idx, aspect))
@@ -152,10 +168,20 @@ def _precompute_batch(data, tokenizer, reward_fn_key) -> None:
         return
 
     items = []
+    skipped_truncated = 0
     for i in range(len(data)):
         data_item = data[i]
         data_source = data_item.non_tensor_batch[reward_fn_key]
         if data_source != "activeultrafeedback":
+            continue
+
+        skip_flag = data_item.non_tensor_batch.get("skip_reward_annotation", False)
+        if skip_flag:
+            _PRECOMPUTED[i] = {
+                "score": 0.0,
+                **{f"reward/{aspect}_score": 0.0 for aspect in ASPECT2ANNOTATION_PROMPT},
+            }
+            skipped_truncated += 1
             continue
 
         prompt_ids = data_item.batch["prompts"]
@@ -182,6 +208,9 @@ def _precompute_batch(data, tokenizer, reward_fn_key) -> None:
             "api_key": api_key,
             "model": model,
         })
+
+    if skipped_truncated > 0:
+        _log(f"precompute: skipped {skipped_truncated} truncated responses (score=0.0)")
 
     if not items:
         return

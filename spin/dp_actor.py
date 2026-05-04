@@ -183,6 +183,8 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
             if "rejected_position_ids" in batch_td:
                 micro_batch_rejected_inputs["position_ids"] = batch_td["rejected_position_ids"][start_idx:end_idx]
 
+            length_normalize = data.meta_info.get("length_normalize", False)
+
             # Determine autocast dtype
             autocast_dtype = torch.bfloat16  # Or get dynamically from config/FSDP settings
             # --- Autocast Forward Pass ---
@@ -193,10 +195,10 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
 
                 # --- Step 2: Calculate CURRENT policy log probs using get_batch_logps ---
                 policy_chosen_logps = get_batch_logps(
-                    policy_chosen_outputs.logits, micro_batch_chosen_labels, average_log_prob=False
+                    policy_chosen_outputs.logits, micro_batch_chosen_labels, average_log_prob=length_normalize
                 )
                 policy_rejected_logps = get_batch_logps(
-                    policy_rejected_outputs.logits, micro_batch_rejected_labels, average_log_prob=False
+                    policy_rejected_outputs.logits, micro_batch_rejected_labels, average_log_prob=length_normalize
                 )
 
                 # --- Step 3: Retrieve PRE-CALCULATED reference log probs (NO grad needed) ---
@@ -234,6 +236,17 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
                 accumulated_metrics["actor/reference_chosen_logps_batch"].append(micro_ref_chosen_logps.mean().item())
                 accumulated_metrics["actor/reference_rejected_logps_batch"].append(
                     micro_ref_rejected_logps.mean().item()
+                )
+                accumulated_metrics["actor/pi_logratios_batch"].append(pi_logratios.mean().item())
+                accumulated_metrics["actor/ref_logratios_batch"].append(ref_logratios.mean().item())
+                accumulated_metrics["actor/beta_pi_logratios_batch"].append((beta * pi_logratios).mean().item())
+                accumulated_metrics["actor/beta_ref_logratios_batch"].append((beta * ref_logratios).mean().item())
+                _pi_mag = pi_logratios.abs().mean().item()
+                _ref_mag = ref_logratios.abs().mean().item()
+                _denom = _pi_mag + _ref_mag
+                accumulated_metrics["actor/ref_fraction_batch"].append(_ref_mag / _denom if _denom > 0 else 0.0)
+                accumulated_metrics["actor/rewards_accuracies_batch"].append(
+                    (logits > 0).float().mean().item()
                 )
 
             # --- Backward Pass (outside autocast) ---
@@ -275,7 +288,9 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
                 metrics["actor/rewards_rejected"] = beta * (
                     metrics["actor/policy_rejected_logps"] - metrics["actor/reference_rejected_logps"]
                 )
-                metrics["actor/rewards_accuracies"] = float(logits_mean > 0)  # Mean accuracy proxy
+                metrics["actor/rewards_accuracies"] = np.mean(
+                    accumulated_metrics.get("actor/rewards_accuracies_batch", [0.0])
+                )
                 metrics["actor/rewards_margins"] = metrics["actor/rewards_chosen"] - metrics["actor/rewards_rejected"]
 
         else:  # Handle case where no micro-batches were run (e.g., bsz=0)
@@ -288,5 +303,8 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
             metrics["actor/rewards_rejected"] = 0.0
             metrics["actor/rewards_accuracies"] = 0.0
             metrics["actor/rewards_margins"] = 0.0
+            metrics["actor/beta_pi_logratios"] = 0.0
+            metrics["actor/beta_ref_logratios"] = 0.0
+            metrics["actor/ref_fraction"] = 0.0
 
         return metrics  # Return aggregated metrics

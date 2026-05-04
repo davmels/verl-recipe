@@ -59,73 +59,50 @@ def get_kl_controller(kl_ctrl):
 def compute_onlinedpo_pref(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
-) -> torch.Tensor:
+    n_rollouts: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Computes preferences between pairs of sequences based on summed rewards
-    and returns a mask aligned with the interleaved batch.
+    For each prompt group of *n_rollouts* interleaved responses, select
+    chosen = argmax(score) and rejected = argmin(score among the rest).
 
-    Assumes inputs are interleaved: [Resp1_Prompt0, Resp2_Prompt0, Resp1_Prompt1, Resp2_Prompt1, ...]
+    Assumes inputs are interleaved:
+        [R0_P0, R1_P0, ..., R(n-1)_P0, R0_P1, R1_P1, ..., R(n-1)_P1, ...]
 
     Args:
-        token_level_rewards: Tensor of shape [batch_size * 2, seq_len]
-        response_mask: Tensor of shape [batch_size * 2, seq_len]
+        token_level_rewards: [num_prompts * n_rollouts, seq_len]
+        response_mask:       [num_prompts * n_rollouts, seq_len]
+        n_rollouts: number of rollouts per prompt (N)
 
     Returns:
-        torch.Tensor: A boolean mask of shape [batch_size * 2], where True indicates
-                      the corresponding entry is the chosen response for its pair.
-                      Example: [True, False, False, True, ...] means for prompt 0,
-                               response 1 was chosen; for prompt 1, response 2 was chosen.
+        chosen_indices:   [num_prompts] — global indices of chosen responses
+        rejected_indices: [num_prompts] — global indices of rejected responses
     """
-    # print(f"---- [DEBUG] Inside compute_onlinedpo_pref ----")
-    if token_level_rewards.shape[0] % 2 != 0 or response_mask.shape[0] % 2 != 0:
+    total = token_level_rewards.shape[0]
+    if total % n_rollouts != 0:
         raise ValueError(
-            f"Input tensor batch dimension must be even for pair comparison, got shapes: "
-            f"{token_level_rewards.shape}, {response_mask.shape}"
+            f"Batch size {total} is not divisible by n_rollouts={n_rollouts}"
         )
     if token_level_rewards.shape != response_mask.shape:
-        raise ValueError(f"Shape mismatch between rewards {token_level_rewards.shape} and mask {response_mask.shape}")
+        raise ValueError(
+            f"Shape mismatch: rewards {token_level_rewards.shape} vs mask {response_mask.shape}"
+        )
 
-    # 1. Calculate Sequence Scores
-    scores = (token_level_rewards * response_mask).sum(dim=-1)
-    # print(f"  Calculated sequence scores shape: {scores.shape}") # [batch_size * 2]
+    scores = (token_level_rewards * response_mask).sum(dim=-1)  # [total]
+    score_groups = scores.view(-1, n_rollouts)  # [num_prompts, n_rollouts]
+    num_prompts = score_groups.shape[0]
 
-    # 2. Reshape scores to group pairs: [batch_size, 2]
-    try:
-        score_pairs = scores.view(-1, 2)
-    except RuntimeError as e:
-        print(f"ERROR reshaping scores (shape {scores.shape}) into pairs: {e}")
-        raise e
-    print(f"  Reshaped score pairs shape: {score_pairs.shape}")  # [batch_size, 2]
+    chosen_local = torch.argmax(score_groups, dim=1)  # [num_prompts]
 
-    # 3. Compare scores to find which index (0 or 1) is the winner within each pair
-    #    winner_indices[i] = 0 if score_pairs[i, 0] >= score_pairs[i, 1] else 1
-    winner_indices = torch.argmax(score_pairs, dim=1)  # 0 if first is max, 1 if second is max
-    # Handle ties explicitly if argmax behavior isn't guaranteed (usually picks first max)
-    # Alternatively: winner_mask_original = score_pairs[:, 0] >= score_pairs[:, 1]
-    # print(f"  Winner indices shape: {winner_indices.shape}") # [batch_size]
-    # print(f"  Number where Response 2 (index 1) is preferred: {winner_indices.sum().item()}") # Counts number of 1s
+    # mask out the chosen position before taking argmin for rejected
+    masked_scores = score_groups.clone()
+    masked_scores[torch.arange(num_prompts, device=scores.device), chosen_local] = float("inf")
+    rejected_local = torch.argmin(masked_scores, dim=1)  # [num_prompts]
 
-    # 4. Create the final [batch_size * 2] mask
-    num_pairs = score_pairs.shape[0]
-    full_batch_size = num_pairs * 2
-    # Create indices for the full batch [0, 1, 2, 3, ..., N*2-1]
-    # full_indices = torch.arange(full_batch_size, device=scores.device)
-    # Create indices corresponding to the winner within each pair's original index
-    # E.g., if winner_indices is [0, 1, 0], pair_indices is [0, 1, 2]
-    # winner_global_indices = (pair_indices * 2) + winner_indices -> [ (0*2)+0, (1*2)+1, (2*2)+0 ] -> [0, 3, 4]
-    pair_indices = torch.arange(num_pairs, device=scores.device)
-    winner_global_indices = (pair_indices * 2) + winner_indices
+    offsets = torch.arange(num_prompts, device=scores.device) * n_rollouts
+    chosen_indices = offsets + chosen_local
+    rejected_indices = offsets + rejected_local
 
-    # Create boolean mask - True at the winner's position
-    output_preference_mask = torch.zeros(full_batch_size, dtype=torch.bool, device=scores.device)
-    output_preference_mask[winner_global_indices] = True
-
-    # print(f"  Output preference mask shape: {output_preference_mask.shape}") # Should be [batch_size * 2]
-    # print(f"  Output mask True count (Chosen): {output_preference_mask.sum().item()}") # Should be batch_size
-    # print(f"  Output mask False count (Rejected): {(~output_preference_mask).sum().item()}") # Should be batch_size
-    # print(f"---- [DEBUG] Exiting compute_onlinedpo_pref ----")
-
-    return output_preference_mask
+    return chosen_indices, rejected_indices
 
 
 def compute_online_dpo_loss(

@@ -22,6 +22,13 @@ from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Optional
 
+_PAIRS_LOG_DIR = "/iopsstor/scratch/cscs/dmelikidze/verl-training/logs"
+os.makedirs(_PAIRS_LOG_DIR, exist_ok=True)
+_PAIRS_JOB_ID = os.environ.get("SLURM_JOB_ID", "nojob")
+_PAIRS_LOG_FILE = open(
+    os.path.join(_PAIRS_LOG_DIR, f"pairs_job{_PAIRS_JOB_ID}_pid{os.getpid()}.log"), "a", buffering=1
+)
+
 import numpy as np
 import ray
 import torch
@@ -221,13 +228,7 @@ def compute_dpo_data_metrics(batch: DataProto) -> dict[str, Any]:
                 }
             )
 
-        # --- Preference accuracy from reward scores ---
-        if "preferences" in batch.batch and batch.batch["preferences"] is not None:
-            preferences = batch.batch["preferences"]
-            n_pairs = preferences.sum().item()
-            n_total = preferences.shape[0] // 2 if preferences.shape[0] > 0 else 0
-            if n_total > 0:
-                metrics["reward/preference_pairs"] = float(n_total)
+        # --- Preference pair count (inferred from batch size / n_rollouts) ---
 
         # --- Ref log prob stats (token-level, before splitting into chosen/rejected) ---
         if "ref_log_prob" in batch.batch and batch.batch["ref_log_prob"] is not None:
@@ -332,42 +333,26 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_onlineDPO_pref(data: DataProto):
+def compute_onlineDPO_pref(data: DataProto, n_rollouts: int = 2):
     """
-    Wrapper to compute DPO preference and add it to the DataProto batch.
-    Includes debugging prints.
+    Compute DPO chosen/rejected indices from token-level rewards.
+    Returns (chosen_idx, rejected_idx) tensors of shape [num_prompts].
     """
-    # print(f"\n---- [DEBUG] Entering compute_onlineDPO_pref ----")
-    # print(f"  Input batch keys: {list(data.batch.keys())}")
-
-    # Check inputs
     rewards_tensor = data.batch.get("token_level_rewards")
     mask_tensor = data.batch.get("response_mask")
 
     if rewards_tensor is None or mask_tensor is None:
         print("  ERROR: Missing 'token_level_rewards' or 'response_mask' in input data!")
-        # Handle error case - maybe return original data or raise?
-        # Returning original data for now to potentially allow skipping
-        return data
+        return None, None
 
     try:
-        preferences = core_algos.compute_onlinedpo_pref(token_level_rewards=rewards_tensor, response_mask=mask_tensor)
-        # Store the result
-        data.batch["preferences"] = preferences
-
-    except AttributeError:
-        print("ERROR: Function 'compute_online_dpo_preference' not found in core_algos.py!")
-        # Assign dummy value or raise error
-        data.batch["preferences"] = None  # Indicate failure
+        return core_algos.compute_onlinedpo_pref(
+            token_level_rewards=rewards_tensor, response_mask=mask_tensor, n_rollouts=n_rollouts,
+        )
     except Exception as e_pref:
-        print(f"ERROR during core_algos.compute_online_dpo_preference: {e_pref}")
-        import traceback
-
+        print(f"ERROR during core_algos.compute_onlinedpo_pref: {e_pref}")
         traceback.print_exc()
-        data.batch["preferences"] = None  # Indicate failure
-
-    # print(f"---- [DEBUG] Exiting compute_onlineDPO_pref ----")
-    return data
+        return None, None
 
 
 @contextmanager
@@ -812,6 +797,32 @@ class RaySPINTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    @staticmethod
+    def _is_valid_checkpoint(ckpt_path):
+        """Check that a checkpoint dir actually contains saved model files."""
+        actor_path = os.path.join(ckpt_path, "actor")
+        if not os.path.isdir(actor_path):
+            return False
+        actor_files = os.listdir(actor_path)
+        return len(actor_files) > 0
+
+    def _find_valid_checkpoint(self, checkpoint_folder):
+        """Find the latest valid checkpoint, skipping corrupted/empty ones."""
+        if not os.path.isdir(checkpoint_folder):
+            return None
+        step_dirs = sorted(
+            [d for d in os.listdir(checkpoint_folder) if d.startswith("global_step_")],
+            key=lambda d: int(d.split("global_step_")[-1]),
+            reverse=True,
+        )
+        for step_dir in step_dirs:
+            candidate = os.path.join(checkpoint_folder, step_dir)
+            if self._is_valid_checkpoint(candidate):
+                return candidate
+            else:
+                print(f"Skipping invalid/incomplete checkpoint: {candidate}")
+        return None
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -824,7 +835,7 @@ class RaySPINTrainer:
             if not os.path.isabs(checkpoint_folder):
                 working_dir = os.getcwd()
                 checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
-            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+            global_step_folder = self._find_valid_checkpoint(checkpoint_folder)
 
         # find global_step_folder
         if self.config.trainer.resume_mode == "auto":
@@ -841,6 +852,8 @@ class RaySPINTrainer:
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
+                if not self._is_valid_checkpoint(global_step_folder):
+                    raise ValueError(f"Checkpoint at {global_step_folder} is invalid/incomplete (empty actor dir)")
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
@@ -1021,9 +1034,11 @@ class RaySPINTrainer:
                         gen_batch = gen_batch.repeat(
                             repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                         )
-                        # (Add Debug prints for gen_batch if needed)
+                        print(f"  [DBG step={self.global_steps}] gen_batch after repeat: "
+                              f"input_ids={gen_batch.batch['input_ids'].shape}", flush=True)
 
                         # Generate sequences (chosen/rejected pairs)
+                        print(f"  [DBG step={self.global_steps}] >>> ENTERING generation", flush=True)
                         with _timer("gen", timing_raw):
                             try:
                                 if self.async_rollout_mode:
@@ -1039,6 +1054,9 @@ class RaySPINTrainer:
                                 step_timer.stop()
                                 continue
 
+                        print(f"  [DBG step={self.global_steps}] <<< GENERATION done "
+                              f"({timing_raw.get('gen', '?'):.1f}s)", flush=True)
+
                         # Combine original prompts with generated sequences
                         batch.non_tensor_batch = original_non_tensor_data  # Restore non-tensor data
                         batch.non_tensor_batch["uid"] = np.array(
@@ -1047,156 +1065,290 @@ class RaySPINTrainer:
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)
 
-                        # Compute response mask (needed for ref logprob calc and DPO prep)
+                        # Compute response mask (needed for reward calc and DPO prep)
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(batch, metrics=metrics)
-
-                        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                        # --- Compute Log Probs for the CURRENT policy (used for KL if enabled, or ActorAsRef
-                        # fallback) ---
-                        # Note: For pure DPO with external ref, this 'old_log_probs' might not be strictly needed
-                        #       unless used for other metrics or a fallback. Keep it for now.
-                        with _timer("policy_log_prob", timing_raw):
-                            policy_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch)
-                            batch = batch.union(policy_log_prob_output)  # Adds 'old_log_probs'
-                            # (Debug prints for old_log_probs)
-
-                        # --- Compute Log Probs using the EXTERNAL Reference Model ---
-                        if self.use_reference_policy:
-                            with _timer("ref_log_prob_dpo", timing_raw):
-                                # print(f"---- [Step {self.global_steps}] DEBUG DPO: Calling compute_ref_log_prob ----")
-                                try:
-                                    # 'batch' contains interleaved chosen/rejected sequences
-                                    ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(
-                                        batch
-                                    )  # Returns DataProto with 'ref_log_prob'
-                                    batch = batch.union(
-                                        ref_log_prob_output
-                                    )  # Adds 'ref_log_prob' key [batch_size * n, seq_len]
-                                    ref_log_prob_computed = True  # Mark success
-                                    # print(f"---- [Step {self.global_steps}] DEBUG DPO: ref_log_prob tensor shape: "
-                                    #       f"{batch.batch['ref_log_prob'].shape} ----")
-                                except Exception as ref_e:
-                                    print(f"ERROR computing reference log probs at step {self.global_steps}: {ref_e}")
-                                    traceback.print_exc()
-                                    batch.batch["ref_log_prob"] = None  # Mark as failed
-                                    ref_log_prob_computed = False
-                        else:
-                            print(
-                                "Warning: Skipping external reference log prob calculation as use_reference_policy "
-                                "is False."
+                        # --- Filter truncated responses before annotation ---
+                        n_rollouts = self.config.actor_rollout_ref.rollout.n
+                        max_resp_len = batch.batch["responses"].shape[1]
+                        resp_lengths = batch.batch["response_mask"].sum(dim=1)
+                        is_truncated = (resp_lengths >= max_resp_len).cpu().numpy()
+                        n_total = len(is_truncated)
+                        n_prompts_in_batch = n_total // n_rollouts
+                        skip_annotation = np.zeros(n_total, dtype=bool)
+                        truncated_prompt_count = 0
+                        for _pi in range(n_prompts_in_batch):
+                            _start = _pi * n_rollouts
+                            _end = _start + n_rollouts
+                            _group_trunc = is_truncated[_start:_end]
+                            n_non_trunc = int((~_group_trunc).sum())
+                            if n_non_trunc >= 2:
+                                skip_annotation[_start:_end] = _group_trunc
+                            else:
+                                truncated_prompt_count += 1
+                        if truncated_prompt_count > 0:
+                            _PAIRS_LOG_FILE.write(
+                                f"[Step {self.global_steps}] WARNING: {truncated_prompt_count}/{n_prompts_in_batch} "
+                                f"prompts have <2 non-truncated responses, annotating all for those.\n"
                             )
-                            # DPO update will likely fail unless ActorAsRef logic is re-enabled in dp_actor
+                            _PAIRS_LOG_FILE.flush()
+                        n_skipped = int(skip_annotation.sum())
+                        print(f"  [Step {self.global_steps}] Truncation filter: {n_skipped}/{n_total} responses skipped, "
+                              f"{truncated_prompt_count} prompts with all truncated", flush=True)
+                        batch.non_tensor_batch["skip_reward_annotation"] = skip_annotation
 
-                        # --- Compute Rewards/Scores (used to determine preference) ---
+                        # --- Compute Rewards/Scores (needed to pick best/worst) ---
+                        print(f"  [DBG step={self.global_steps}] >>> ENTERING reward_calc", flush=True)
                         with _timer("reward_calc", timing_raw):
-                            # (Reward calculation logic using RM or reward_fn as before)
-                            # ... Ensure this calculates 'token_level_rewards' or similar ...
                             if self.use_rm:
                                 reward_tensor_rm = self.rm_wg.compute_rm_score(batch)
-                                batch = batch.union(reward_tensor_rm)  # Adds 'rm_scores'
+                                batch = batch.union(reward_tensor_rm)
 
                             reward_extra_infos_dict = {}
                             try:
                                 if self.reward_fn is None:
-                                    #  print(f"---- [DEBUG Step {self.global_steps}] ERROR: self.reward_fn is None! "
-                                    #        f"Using dummy rewards. ----")
-                                    # Use rm_scores if available, otherwise zeros
                                     reward_tensor = batch.batch.get(
                                         "rm_scores", torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
                                     )
                                 else:
                                     reward_result = self.reward_fn(batch, return_dict=True)
-                                    reward_tensor = reward_result["reward_tensor"]  # Final combined reward
+                                    reward_tensor = reward_result["reward_tensor"]
                                     reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
 
                             except Exception:
-                                # print(f'---- [DEBUG Step {self.global_steps}] Error in reward_fn call: {e}. '
-                                #       f'Using dummy rewards. ----')
                                 traceback.print_exc()
                                 reward_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
                                 reward_extra_infos_dict = {}
 
-                            # Use 'token_level_rewards' as the key for preference calculation
                             batch.batch["token_level_rewards"] = reward_tensor
                             if reward_extra_infos_dict:
                                 batch.non_tensor_batch.update(
                                     {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                                 )
 
-                        # --- Determine Preferences ---
-                        # Uses 'token_level_rewards' to determine chosen/rejected based on score
-                        batch = compute_onlineDPO_pref(batch)  # Adds 'preferences' key
+                        print(f"  [DBG step={self.global_steps}] <<< reward_calc done "
+                              f"({timing_raw.get('reward_calc', '?'):.1f}s)", flush=True)
+
+                        # --- Select chosen/rejected indices (excluding truncated) ---
+                        n_rollouts = self.config.actor_rollout_ref.rollout.n
+                        print(f"  [DBG step={self.global_steps}] >>> ENTERING preference selection "
+                              f"(n_rollouts={n_rollouts})", flush=True)
+
+                        _resp_mask_sel = batch.batch["response_mask"]
+                        _tok_rew_sel = batch.batch["token_level_rewards"]
+                        _scores_sel = (_tok_rew_sel * _resp_mask_sel).sum(dim=-1)
+                        _score_groups = _scores_sel.view(-1, n_rollouts)
+                        _trunc_groups = torch.tensor(
+                            is_truncated.reshape(-1, n_rollouts), device=_scores_sel.device, dtype=torch.bool
+                        )
+                        _n_prompts_sel = _score_groups.shape[0]
+
+                        chosen_idx_list = []
+                        rejected_idx_list = []
+                        fallback_prompts = 0
+                        for _pi in range(_n_prompts_sel):
+                            _valid_mask = ~_trunc_groups[_pi]
+                            _valid_indices = _valid_mask.nonzero(as_tuple=True)[0]
+                            if len(_valid_indices) >= 2:
+                                _valid_scores = _score_groups[_pi][_valid_indices]
+                                _best_local = _valid_indices[_valid_scores.argmax()]
+                                _worst_local = _valid_indices[_valid_scores.argmin()]
+                            else:
+                                fallback_prompts += 1
+                                _all_indices = torch.arange(n_rollouts, device=_score_groups.device)
+                                _all_scores = _score_groups[_pi]
+                                _best_local = _all_indices[_all_scores.argmax()]
+                                _worst_local = _all_indices[_all_scores.argmin()]
+                            _offset = _pi * n_rollouts
+                            chosen_idx_list.append(_offset + _best_local.item())
+                            rejected_idx_list.append(_offset + _worst_local.item())
+
+                        if fallback_prompts > 0:
+                            _PAIRS_LOG_FILE.write(
+                                f"[Step {self.global_steps}] WARNING: {fallback_prompts}/{_n_prompts_sel} prompts "
+                                f"had <2 non-truncated responses, used all responses for those.\n"
+                            )
+                            _PAIRS_LOG_FILE.flush()
+                            print(f"  [Step {self.global_steps}] {fallback_prompts}/{_n_prompts_sel} prompts "
+                                  f"fell back to all responses (< 2 non-truncated)", flush=True)
+
+                        chosen_idx = torch.tensor(chosen_idx_list, device=_scores_sel.device)
+                        rejected_idx = torch.tensor(rejected_idx_list, device=_scores_sel.device)
+                        print(f"  [DBG step={self.global_steps}] <<< preference selection done "
+                              f"(chosen={chosen_idx.shape})", flush=True)
+
+                        # Log chosen/rejected reward stats
+                        _resp_mask_all = batch.batch["response_mask"]
+                        _tok_rewards_all = batch.batch["token_level_rewards"]
+                        _seq_rewards_all = (_tok_rewards_all * _resp_mask_all).sum(-1)
+                        chosen_rewards = _seq_rewards_all[chosen_idx]
+                        rejected_rewards = _seq_rewards_all[rejected_idx]
+                        reward_margin = chosen_rewards - rejected_rewards
+                        metrics["reward/chosen/mean"] = chosen_rewards.mean().item()
+                        metrics["reward/rejected/mean"] = rejected_rewards.mean().item()
+                        metrics["reward/margin/mean"] = reward_margin.mean().item()
+                        metrics["reward/margin/min"] = reward_margin.min().item()
+                        metrics["reward/margin/max"] = reward_margin.max().item()
+                        print(f"  [Step {self.global_steps}] reward chosen={chosen_rewards.mean().item():.3f} "
+                              f"rejected={rejected_rewards.mean().item():.3f} "
+                              f"margin={reward_margin.mean().item():.3f}")
+
+                        # Log chosen/rejected response pairs to file
+                        _n_log = min(5, len(chosen_idx))
+                        for _i in range(_n_log):
+                            _c_ids = batch.batch["responses"][chosen_idx[_i]]
+                            _r_ids = batch.batch["responses"][rejected_idx[_i]]
+                            _p_ids = batch.batch["prompts"][chosen_idx[_i]]
+                            _p_mask = batch.batch["attention_mask"][chosen_idx[_i]]
+                            _p_len = _p_mask[:_p_ids.shape[0]].sum().item()
+                            _prompt_str = self.tokenizer.decode(_p_ids[-int(_p_len):], skip_special_tokens=False)
+                            _c_str = self.tokenizer.decode(_c_ids, skip_special_tokens=False)
+                            _r_str = self.tokenizer.decode(_r_ids, skip_special_tokens=False)
+                            _PAIRS_LOG_FILE.write(
+                                f"\n{'='*80}\n"
+                                f"[Step {self.global_steps} | Pair {_i}]\n"
+                                f"Chosen reward: {chosen_rewards[_i].item():.3f} | "
+                                f"Rejected reward: {rejected_rewards[_i].item():.3f} | "
+                                f"Margin: {reward_margin[_i].item():.3f}\n"
+                                f"\n--- PROMPT ---\n{_prompt_str}\n"
+                                f"\n--- CHOSEN ---\n{_c_str}\n"
+                                f"\n--- REJECTED ---\n{_r_str}\n"
+                                f"{'='*80}\n\n"
+                            )
+                            _PAIRS_LOG_FILE.flush()
+
+                        # --- Build subset batch with only chosen+rejected (2 per prompt) ---
+                        subset_idx = torch.cat([chosen_idx, rejected_idx], dim=0)
+                        subset_batch = batch[subset_idx]
+                        num_prompts = chosen_idx.shape[0]
+                        print(f"  [DBG step={self.global_steps}] Subset batch: {subset_batch.batch['input_ids'].shape[0]} "
+                              f"rows (from {batch.batch['input_ids'].shape[0]} total rollouts)", flush=True)
+
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(subset_batch, metrics=metrics)
+
+                        subset_batch.meta_info["global_token_num"] = torch.sum(
+                            subset_batch.batch["attention_mask"], dim=-1
+                        ).tolist()
+
+                        # --- Compute policy log probs on subset only ---
+                        print(f"  [DBG step={self.global_steps}] >>> ENTERING policy_log_prob "
+                              f"(subset size={subset_batch.batch['input_ids'].shape[0]})", flush=True)
+                        with _timer("policy_log_prob", timing_raw):
+                            policy_log_prob_output = self.actor_rollout_wg.compute_log_prob(subset_batch)
+                            subset_batch = subset_batch.union(policy_log_prob_output)
+
+                        print(f"  [DBG step={self.global_steps}] <<< policy_log_prob done "
+                              f"({timing_raw.get('policy_log_prob', '?'):.1f}s)", flush=True)
+
+                        # --- Compute ref log probs on subset only ---
+                        if self.use_reference_policy:
+                            print(f"  [DBG step={self.global_steps}] >>> ENTERING ref_log_prob "
+                                  f"(subset size={subset_batch.batch['input_ids'].shape[0]})", flush=True)
+                            with _timer("ref_log_prob_dpo", timing_raw):
+                                try:
+                                    ref_log_prob_output = self.ref_policy_wg.compute_ref_log_prob(subset_batch)
+                                    subset_batch = subset_batch.union(ref_log_prob_output)
+                                    ref_log_prob_computed = True
+                                except Exception as ref_e:
+                                    print(f"ERROR computing reference log probs at step {self.global_steps}: {ref_e}")
+                                    traceback.print_exc()
+                                    subset_batch.batch["ref_log_prob"] = None
+                                    ref_log_prob_computed = False
+                            print(f"  [DBG step={self.global_steps}] <<< ref_log_prob done "
+                                  f"({timing_raw.get('ref_log_prob_dpo', '?'):.1f}s)", flush=True)
+                        else:
+                            print(
+                                "Warning: Skipping external reference log prob calculation as use_reference_policy "
+                                "is False."
+                            )
+
+                        # --- Compute KL divergence between policy and ref on subset ---
+                        if (
+                            ref_log_prob_computed
+                            and "old_log_probs" in subset_batch.batch
+                            and "ref_log_prob" in subset_batch.batch
+                            and subset_batch.batch["old_log_probs"] is not None
+                            and subset_batch.batch["ref_log_prob"] is not None
+                        ):
+                            _resp_mask = subset_batch.batch["response_mask"]
+                            _kl = subset_batch.batch["old_log_probs"] - subset_batch.batch["ref_log_prob"]
+                            _kl_masked = _kl * _resp_mask
+                            _kl_raw_per_seq = _kl_masked.sum(-1)
+                            _kl_per_seq = _kl_raw_per_seq / _resp_mask.sum(-1).clamp(min=1)
+                            # raw (sequence-level, not normalized by length)
+                            metrics["kl/policy_vs_ref_raw/mean"] = torch.mean(_kl_raw_per_seq).item()
+                            metrics["kl/policy_vs_ref_raw/chosen"] = torch.mean(_kl_raw_per_seq[:num_prompts]).item()
+                            metrics["kl/policy_vs_ref_raw/rejected"] = torch.mean(_kl_raw_per_seq[num_prompts:]).item()
+                            # per-token (normalized by response length)
+                            metrics["kl/policy_vs_ref/mean"] = torch.mean(_kl_per_seq).item()
+                            metrics["kl/policy_vs_ref/max"] = torch.max(_kl_per_seq).item()
+                            metrics["kl/policy_vs_ref/min"] = torch.min(_kl_per_seq).item()
+                            metrics["kl/chosen/mean"] = torch.mean(_kl_per_seq[:num_prompts]).item()
+                            metrics["kl/rejected/mean"] = torch.mean(_kl_per_seq[num_prompts:]).item()
 
                         # --- Prepare DPO Batch ---
-                        dpo_update_batch_proto = None  # Initialize
+                        # subset_batch is ordered as [chosen_0..chosen_N, rejected_0..rejected_N]
+                        dpo_update_batch_proto = None
                         with _timer("prepare_dpo_batch", timing_raw):
                             try:
-                                if "preferences" not in batch.batch or batch.batch["preferences"] is None:
-                                    raise ValueError("'preferences' key missing or None after compute_onlineDPO_pref.")
-
-                                # Check if reference log probs were computed successfully (if needed)
                                 if self.use_reference_policy and not ref_log_prob_computed:
                                     raise ValueError("Reference log probs required but failed to compute.")
 
-                                # Check required base keys
                                 required_keys = ["input_ids", "attention_mask", "response_mask"]
                                 for rk in required_keys:
-                                    if rk not in batch.batch or batch.batch[rk] is None:
-                                        raise KeyError(f"Required key '{rk}' missing from batch for DPO prep.")
+                                    if rk not in subset_batch.batch or subset_batch.batch[rk] is None:
+                                        raise KeyError(f"Required key '{rk}' missing from subset_batch for DPO prep.")
 
-                                preferences_mask = batch.batch["preferences"]  # Shape [batch_size * n]
-                                not_preferences_mask = ~preferences_mask
-
-                                # Gather Chosen/Rejected Base Tensors
-                                chosen_input_ids = batch.batch["input_ids"][preferences_mask]
-                                chosen_attention_mask = batch.batch["attention_mask"][preferences_mask]
-                                rejected_input_ids = batch.batch["input_ids"][not_preferences_mask]
-                                rejected_attention_mask = batch.batch["attention_mask"][not_preferences_mask]
+                                chosen_input_ids = subset_batch.batch["input_ids"][:num_prompts]
+                                chosen_attention_mask = subset_batch.batch["attention_mask"][:num_prompts]
+                                rejected_input_ids = subset_batch.batch["input_ids"][num_prompts:]
+                                rejected_attention_mask = subset_batch.batch["attention_mask"][num_prompts:]
                                 chosen_position_ids = (
-                                    batch.batch.get("position_ids")[preferences_mask]
-                                    if "position_ids" in batch.batch
+                                    subset_batch.batch["position_ids"][:num_prompts]
+                                    if "position_ids" in subset_batch.batch
                                     else None
                                 )
                                 rejected_position_ids = (
-                                    batch.batch.get("position_ids")[not_preferences_mask]
-                                    if "position_ids" in batch.batch
+                                    subset_batch.batch["position_ids"][num_prompts:]
+                                    if "position_ids" in subset_batch.batch
                                     else None
                                 )
 
-                                # Create Labels
-                                print("WARNING: Creating DPO labels using configured max_prompt_length...")
-                                prompt_len = self.config.data.max_prompt_length
+                                chosen_response_mask = subset_batch.batch["response_mask"][:num_prompts]
+                                rejected_response_mask = subset_batch.batch["response_mask"][num_prompts:]
+                                seq_len = chosen_input_ids.shape[1]
+                                resp_len = chosen_response_mask.shape[1]
+                                prompt_len = seq_len - resp_len
+                                prompt_pad = torch.zeros(
+                                    chosen_response_mask.shape[0], prompt_len,
+                                    dtype=chosen_response_mask.dtype, device=chosen_response_mask.device
+                                )
+                                chosen_full_mask = torch.cat([prompt_pad, chosen_response_mask], dim=1)
+                                rejected_full_mask = torch.cat([
+                                    torch.zeros(rejected_response_mask.shape[0], prompt_len,
+                                                dtype=rejected_response_mask.dtype, device=rejected_response_mask.device),
+                                    rejected_response_mask
+                                ], dim=1)
                                 chosen_labels = chosen_input_ids.clone()
-                                chosen_labels[:, :prompt_len] = -100
+                                chosen_labels[chosen_full_mask == 0] = -100
                                 rejected_labels = rejected_input_ids.clone()
-                                rejected_labels[:, :prompt_len] = -100
+                                rejected_labels[rejected_full_mask == 0] = -100
 
-                                # Calculate and Gather Reference Log Probs (Sequence Level)
                                 if self.use_reference_policy:
-                                    ref_log_prob_tensor = batch.batch["ref_log_prob"]  # Token level [bsz * n, seq_len]
-                                    response_mask_full = batch.batch[
-                                        "response_mask"
-                                    ]  # Response mask [bsz * n, seq_len]
-                                    ref_sequence_logps = (ref_log_prob_tensor * response_mask_full).sum(
-                                        dim=-1
-                                    )  # Sequence level [bsz * n]
-                                    reference_chosen_logps = ref_sequence_logps[preferences_mask]
-                                    reference_rejected_logps = ref_sequence_logps[not_preferences_mask]
+                                    ref_log_prob_tensor = subset_batch.batch["ref_log_prob"]
+                                    response_mask_sub = subset_batch.batch["response_mask"]
+                                    length_normalize = self.config.algorithm.get("length_normalize", False)
+                                    ref_sequence_logps = (ref_log_prob_tensor * response_mask_sub).sum(dim=-1)
+                                    if length_normalize:
+                                        response_lengths = response_mask_sub.sum(dim=-1).clamp(min=1)
+                                        ref_sequence_logps = ref_sequence_logps / response_lengths
+                                    reference_chosen_logps = ref_sequence_logps[:num_prompts]
+                                    reference_rejected_logps = ref_sequence_logps[num_prompts:]
                                 else:
-                                    # If not using external ref, DPO needs ActorAsRef logic in dp_actor
-                                    # We won't add the keys here, dp_actor will handle it (or fail if not modified)
-                                    print(
-                                        "Info: Not adding explicit reference logps to DPO batch "
-                                        "(use_reference_policy=False)."
-                                    )
-                                    reference_chosen_logps = None  # Explicitly None
+                                    reference_chosen_logps = None
                                     reference_rejected_logps = None
 
-                                # Package Tensors
                                 dpo_tensors = {
                                     "chosen_input_ids": chosen_input_ids,
                                     "chosen_attention_mask": chosen_attention_mask,
@@ -1205,18 +1357,15 @@ class RaySPINTrainer:
                                     "rejected_attention_mask": rejected_attention_mask,
                                     "rejected_labels": rejected_labels,
                                 }
-                                # Conditionally add reference logps if computed
                                 if reference_chosen_logps is not None:
                                     dpo_tensors["reference_chosen_logps"] = reference_chosen_logps
                                 if reference_rejected_logps is not None:
                                     dpo_tensors["reference_rejected_logps"] = reference_rejected_logps
-                                # Add position ids if they exist
                                 if chosen_position_ids is not None:
                                     dpo_tensors["chosen_position_ids"] = chosen_position_ids
                                 if rejected_position_ids is not None:
                                     dpo_tensors["rejected_position_ids"] = rejected_position_ids
 
-                                # Prepare Meta Info
                                 dpo_global_token_num = (
                                     torch.cat([chosen_attention_mask, rejected_attention_mask], dim=0)
                                     .sum(dim=-1)
@@ -1230,29 +1379,34 @@ class RaySPINTrainer:
                                     "dpo_label_smoothing": OmegaConf.select(
                                         self.config.algorithm, "dpo_label_smoothing", default=0.0
                                     ),
+                                    "length_normalize": OmegaConf.select(
+                                        self.config.algorithm, "length_normalize", default=False
+                                    ),
                                     "use_reference_policy": self.use_reference_policy,
-                                    "reference_free": not self.use_reference_policy,  # False if using external ref
+                                    "reference_free": not self.use_reference_policy,
                                     "global_step": self.global_steps,
                                     "global_token_num": dpo_global_token_num,
                                 }
 
                                 dpo_update_batch_proto = DataProto.from_dict(tensors=dpo_tensors, meta_info=dpo_meta)
-                                # print(f"---- [Step {self.global_steps}] DEBUG DPO: Prepared DPO Update Batch ----")
-                                # print(f"  Keys: {list(dpo_update_batch_proto.batch.keys())}")
-                                # print(f"  Meta Info: {dpo_meta}")
+                                print(f"  [DBG step={self.global_steps}] <<< prepare_dpo_batch done "
+                                      f"(chosen={dpo_update_batch_proto.batch['chosen_input_ids'].shape})",
+                                      flush=True)
 
                             except Exception as e_prep:
                                 print(f"ERROR preparing DPO batch at step {self.global_steps}: {e_prep}")
                                 traceback.print_exc()
-                                dpo_update_batch_proto = None  # Skip update on error
+                                dpo_update_batch_proto = None
 
                         # --- Actor Update Step ---
                         actor_output = None
                         if self.config.trainer.critic_warmup <= self.global_steps and dpo_update_batch_proto:
+                            print(f"  [DBG step={self.global_steps}] >>> ENTERING update_actor_dpo "
+                                  f"(batch size={dpo_update_batch_proto.batch['chosen_input_ids'].shape})", flush=True)
                             with _timer("update_actor", timing_raw):
-                                # Pass the batch containing reference log probs (if computed)
-                                # The modified update_actor_dpo expects them if reference_free=False
                                 actor_output = self.actor_rollout_wg.update_actor_dpo(dpo_update_batch_proto)
+                            print(f"  [DBG step={self.global_steps}] <<< update_actor_dpo done "
+                                  f"({timing_raw.get('update_actor', '?'):.1f}s)", flush=True)
                             if actor_output is not None and "metrics" in actor_output.meta_info:
                                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
                         elif dpo_update_batch_proto is None:
