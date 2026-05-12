@@ -120,6 +120,88 @@ def make_spin_collate_fn(tokenizer, max_prompt_length: int, truncation: str = "e
     return _collate
 
 
+def tokenize_offpolicy_pairs(batch: "DataProto", tokenizer, max_prompt_length: int, max_response_length: int):
+    """Build rollout-compatible DataProtos for off-policy chosen and rejected pairs.
+
+    Takes a batch produced by the standard collate_fn (prompts already tokenized)
+    and the chosen_response / rejected_response dicts carried in non_tensor_batch.
+    Returns a single DataProto with 2*N rows (chosen first, rejected second) that
+    has the same tensor layout as on-policy rollout output after union:
+        input_ids      [2N, prompt_len + resp_len]
+        attention_mask  [2N, prompt_len + resp_len]
+        position_ids   [2N, prompt_len + resp_len]
+        responses      [2N, resp_len]
+        response_mask  [2N, resp_len]
+        prompts        [2N, prompt_len]
+    """
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    prompt_input_ids = batch.batch["input_ids"]          # [N, prompt_len]  (left-padded)
+    prompt_attention_mask = batch.batch["attention_mask"] # [N, prompt_len]
+    n = prompt_input_ids.shape[0]
+    prompt_len = prompt_input_ids.shape[1]
+
+    chosen_responses = batch.non_tensor_batch["chosen_response"]   # array of dicts
+    rejected_responses = batch.non_tensor_batch["rejected_response"]
+
+    all_input_ids = []
+    all_attention_mask = []
+    all_responses = []
+    all_response_mask = []
+    all_prompts = []
+
+    for side_responses in [chosen_responses, rejected_responses]:
+        for i in range(n):
+            p_ids = prompt_input_ids[i]       # [prompt_len]
+            p_mask = prompt_attention_mask[i]  # [prompt_len]
+
+            resp_msg = side_responses[i]
+            raw_prompt_msgs = batch.non_tensor_batch["raw_prompt"][i]
+
+            full_msgs = list(raw_prompt_msgs) + [resp_msg]
+            full_text = tokenizer.apply_chat_template(full_msgs, add_generation_prompt=False, tokenize=False)
+            prompt_text = tokenizer.apply_chat_template(raw_prompt_msgs, add_generation_prompt=True, tokenize=False)
+            full_tok = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+            prompt_tok = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+            resp_ids = full_tok[len(prompt_tok):]
+
+            if len(resp_ids) > max_response_length:
+                resp_ids = resp_ids[:max_response_length]
+            resp_len_actual = len(resp_ids)
+
+            resp_tensor = torch.full((max_response_length,), pad_id, dtype=torch.long)
+            resp_tensor[:resp_len_actual] = torch.tensor(resp_ids, dtype=torch.long)
+            resp_mask = torch.zeros(max_response_length, dtype=torch.long)
+            resp_mask[:resp_len_actual] = 1
+
+            seq_ids = torch.cat([p_ids, resp_tensor], dim=0)
+            seq_mask = torch.cat([p_mask, resp_mask], dim=0)
+
+            all_input_ids.append(seq_ids)
+            all_attention_mask.append(seq_mask)
+            all_responses.append(resp_tensor)
+            all_response_mask.append(resp_mask)
+            all_prompts.append(p_ids)
+
+    input_ids = torch.stack(all_input_ids, dim=0)
+    attention_mask = torch.stack(all_attention_mask, dim=0)
+    position_ids = compute_position_id_with_mask(attention_mask)
+    responses = torch.stack(all_responses, dim=0)
+    response_mask = torch.stack(all_response_mask, dim=0)
+    prompts = torch.stack(all_prompts, dim=0)
+
+    from tensordict import TensorDict
+    td = TensorDict({
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "responses": responses,
+        "response_mask": response_mask,
+        "prompts": prompts,
+    }, batch_size=2 * n)
+
+    return DataProto(batch=td)
+
+
 @dataclass
 class ResourcePoolManager:
     """
@@ -418,7 +500,7 @@ class RaySPINTrainer:
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
         """
-        Creates the train and validation dataloaders.
+        Creates the train and validation dataloaders, plus an optional off-policy dataloader.
         """
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
@@ -479,6 +561,42 @@ class RaySPINTrainer:
             f"Size of train dataloader: {len(self.train_dataloader)}, "
             f"Size of val dataloader: {len(self.val_dataloader)}"
         )
+
+        # --- Off-policy dataloader (optional) ---
+        offpolicy_files = self.config.data.get("offpolicy_files", None)
+        self.offpolicy_dataloader = None
+        if offpolicy_files:
+            offpolicy_data_config = OmegaConf.to_container(self.config.data, resolve=True)
+            offpolicy_data_config["train_files"] = offpolicy_files if isinstance(offpolicy_files, list) else [offpolicy_files]
+            offpolicy_data_config["seed"] = (offpolicy_data_config.get("seed") or 42) + 7919
+            offpolicy_data_config = OmegaConf.create(offpolicy_data_config)
+
+            offpolicy_dataset = create_rl_dataset(
+                offpolicy_data_config.train_files,
+                offpolicy_data_config,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("offpolicy_max_samples", -1),
+            )
+            offpolicy_sampler = create_rl_sampler(offpolicy_data_config, offpolicy_dataset)
+            offpolicy_collate_fn = make_spin_collate_fn(
+                tokenizer=self.tokenizer,
+                max_prompt_length=self.config.data.max_prompt_length,
+                truncation=self.config.data.get("truncation", "error"),
+            )
+            offpolicy_batch_size = self.config.data.get("offpolicy_batch_size", self.config.data.train_batch_size)
+            self.offpolicy_dataloader = StatefulDataLoader(
+                dataset=offpolicy_dataset,
+                batch_size=offpolicy_batch_size,
+                num_workers=self.config.data.get("dataloader_num_workers", 8),
+                drop_last=True,
+                collate_fn=offpolicy_collate_fn,
+                sampler=offpolicy_sampler,
+            )
+            print(
+                f"Off-policy dataloader created: {len(self.offpolicy_dataloader)} batches, "
+                f"batch_size={offpolicy_batch_size}, dataset_size={len(offpolicy_dataset)}"
+            )
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
@@ -742,6 +860,19 @@ class RaySPINTrainer:
         )
         self.async_rollout_mode = True
 
+        from verl.checkpoint_engine import CheckpointEngineManager
+        from verl.utils.config import omega_conf_to_dataclass
+
+        checkpoint_engine_config = omega_conf_to_dataclass(
+            self.config.actor_rollout_ref.rollout.checkpoint_engine
+        )
+        self.checkpoint_manager = CheckpointEngineManager(
+            config=checkpoint_engine_config,
+            trainer=self.actor_rollout_wg,
+            replicas=self.async_rollout_manager.rollout_replicas,
+        )
+        self.checkpoint_manager.sleep_replicas()
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(
@@ -789,6 +920,10 @@ class RaySPINTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+
+        if self.offpolicy_dataloader is not None:
+            offpolicy_local_path = os.path.join(local_global_step_folder, "offpolicy_data.pt")
+            torch.save(self.offpolicy_dataloader.state_dict(), offpolicy_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
@@ -882,6 +1017,16 @@ class RaySPINTrainer:
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+        if self.offpolicy_dataloader is not None:
+            offpolicy_local_path = os.path.join(global_step_folder, "offpolicy_data.pt")
+            if os.path.exists(offpolicy_local_path):
+                offpolicy_state_dict = torch.load(offpolicy_local_path, weights_only=False)
+                self.offpolicy_dataloader.load_state_dict(offpolicy_state_dict)
+            else:
+                print(f"Warning: No off-policy dataloader state found at {offpolicy_local_path}, will start from scratch")
+
+        return self.global_steps
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -933,6 +1078,10 @@ class RaySPINTrainer:
         )
         print(f"Reference model update frequency: {self.config.trainer.get('ref_update_freq', 'Not Set')}")
 
+        # Wake up rollout replicas and sync initial weights
+        self.checkpoint_manager.update_weights(self.global_steps)
+        print("Initial weight sync to rollout replicas complete.")
+
         # Check if reference policy is configured correctly for this mode
         if not self.use_reference_policy:
             print(
@@ -968,6 +1117,8 @@ class RaySPINTrainer:
         last_val_metrics = None
         should_stop = False
 
+        offpolicy_iterator = None
+
         for epoch in range(self.config.trainer.total_epochs):
             if should_stop:
                 break
@@ -977,6 +1128,9 @@ class RaySPINTrainer:
             except TypeError:
                 print("Warning: Dataloader is not iterable.")
                 train_iterator = self.train_dataloader  # Fallback attempt
+
+            if self.offpolicy_dataloader is not None:
+                offpolicy_iterator = iter(self.offpolicy_dataloader)
 
             for batch_idx, batch_dict in enumerate(train_iterator):
                 if self.global_steps > self.total_training_steps:
@@ -1056,6 +1210,8 @@ class RaySPINTrainer:
 
                         print(f"  [DBG step={self.global_steps}] <<< GENERATION done "
                               f"({timing_raw.get('gen', '?'):.1f}s)", flush=True)
+
+                        self.checkpoint_manager.sleep_replicas()
 
                         # Combine original prompts with generated sequences
                         batch.non_tensor_batch = original_non_tensor_data  # Restore non-tensor data
@@ -1398,6 +1554,175 @@ class RaySPINTrainer:
                                 traceback.print_exc()
                                 dpo_update_batch_proto = None
 
+                        # --- Off-policy DPO batch ---
+                        offpolicy_dpo_proto = None
+                        if offpolicy_iterator is not None:
+                            with _timer("offpolicy", timing_raw):
+                                try:
+                                    try:
+                                        offpolicy_batch_dict = next(offpolicy_iterator)
+                                    except StopIteration:
+                                        offpolicy_iterator = iter(self.offpolicy_dataloader)
+                                        offpolicy_batch_dict = next(offpolicy_iterator)
+
+                                    offpolicy_batch: DataProto = DataProto.from_single_dict(offpolicy_batch_dict)
+                                    offpolicy_n = offpolicy_batch.batch.batch_size[0]
+                                    print(f"  [Step {self.global_steps}] Off-policy batch: {offpolicy_n} prompts",
+                                          flush=True)
+
+                                    max_resp_len = self.config.data.max_response_length
+                                    max_prmpt_len = self.config.data.max_prompt_length
+                                    offpolicy_pairs = tokenize_offpolicy_pairs(
+                                        offpolicy_batch, self.tokenizer, max_prmpt_len, max_resp_len,
+                                    )
+
+                                    offpolicy_pairs.meta_info["micro_batch_size"] = (
+                                        self.config.actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu", 1)
+                                    )
+                                    offpolicy_pairs.meta_info["temperature"] = (
+                                        self.config.actor_rollout_ref.rollout.get("temperature", 1.0)
+                                    )
+                                    offpolicy_pairs.meta_info["use_dynamic_bsz"] = (
+                                        self.config.actor_rollout_ref.actor.get("use_dynamic_bsz", False)
+                                    )
+                                    if offpolicy_pairs.meta_info["use_dynamic_bsz"]:
+                                        offpolicy_pairs.meta_info["max_token_len"] = (
+                                            self.config.actor_rollout_ref.actor.get("max_token_len", 0)
+                                        )
+
+                                    print(f"  [Step {self.global_steps}] Off-policy: computing policy log-probs "
+                                          f"({offpolicy_pairs.batch['input_ids'].shape})", flush=True)
+                                    offpolicy_logprob_out = self.actor_rollout_wg.compute_log_prob(offpolicy_pairs)
+                                    offpolicy_pairs = offpolicy_pairs.union(offpolicy_logprob_out)
+
+                                    if self.use_reference_policy:
+                                        print(f"  [Step {self.global_steps}] Off-policy: computing ref log-probs",
+                                              flush=True)
+                                        offpolicy_ref_out = self.ref_policy_wg.compute_ref_log_prob(offpolicy_pairs)
+                                        offpolicy_pairs = offpolicy_pairs.union(offpolicy_ref_out)
+
+                                    op_resp_mask = offpolicy_pairs.batch["response_mask"]
+                                    op_input_ids = offpolicy_pairs.batch["input_ids"]
+                                    op_attn_mask = offpolicy_pairs.batch["attention_mask"]
+                                    op_pos_ids = offpolicy_pairs.batch.get("position_ids", None)
+
+                                    op_chosen_ids = op_input_ids[:offpolicy_n]
+                                    op_chosen_attn = op_attn_mask[:offpolicy_n]
+                                    op_rejected_ids = op_input_ids[offpolicy_n:]
+                                    op_rejected_attn = op_attn_mask[offpolicy_n:]
+
+                                    op_chosen_resp_mask = op_resp_mask[:offpolicy_n]
+                                    op_rejected_resp_mask = op_resp_mask[offpolicy_n:]
+                                    op_seq_len = op_input_ids.shape[1]
+                                    op_resp_len_dim = op_resp_mask.shape[1]
+                                    op_prompt_len = op_seq_len - op_resp_len_dim
+                                    op_prompt_pad_c = torch.zeros(
+                                        offpolicy_n, op_prompt_len,
+                                        dtype=op_chosen_resp_mask.dtype, device=op_chosen_resp_mask.device
+                                    )
+                                    op_chosen_full_mask = torch.cat([op_prompt_pad_c, op_chosen_resp_mask], dim=1)
+                                    op_prompt_pad_r = torch.zeros(
+                                        offpolicy_n, op_prompt_len,
+                                        dtype=op_rejected_resp_mask.dtype, device=op_rejected_resp_mask.device
+                                    )
+                                    op_rejected_full_mask = torch.cat([op_prompt_pad_r, op_rejected_resp_mask], dim=1)
+
+                                    op_chosen_labels = op_chosen_ids.clone()
+                                    op_chosen_labels[op_chosen_full_mask == 0] = -100
+                                    op_rejected_labels = op_rejected_ids.clone()
+                                    op_rejected_labels[op_rejected_full_mask == 0] = -100
+
+                                    length_normalize = self.config.algorithm.get("length_normalize", False)
+                                    if self.use_reference_policy and "ref_log_prob" in offpolicy_pairs.batch:
+                                        op_ref_lp = offpolicy_pairs.batch["ref_log_prob"]
+                                        op_ref_seq_logps = (op_ref_lp * op_resp_mask).sum(dim=-1)
+                                        if length_normalize:
+                                            op_ref_seq_logps = op_ref_seq_logps / op_resp_mask.sum(dim=-1).clamp(min=1)
+                                        op_ref_chosen_logps = op_ref_seq_logps[:offpolicy_n]
+                                        op_ref_rejected_logps = op_ref_seq_logps[offpolicy_n:]
+                                    else:
+                                        op_ref_chosen_logps = None
+                                        op_ref_rejected_logps = None
+
+                                    op_dpo_tensors = {
+                                        "chosen_input_ids": op_chosen_ids,
+                                        "chosen_attention_mask": op_chosen_attn,
+                                        "chosen_labels": op_chosen_labels,
+                                        "rejected_input_ids": op_rejected_ids,
+                                        "rejected_attention_mask": op_rejected_attn,
+                                        "rejected_labels": op_rejected_labels,
+                                    }
+                                    if op_ref_chosen_logps is not None:
+                                        op_dpo_tensors["reference_chosen_logps"] = op_ref_chosen_logps
+                                    if op_ref_rejected_logps is not None:
+                                        op_dpo_tensors["reference_rejected_logps"] = op_ref_rejected_logps
+                                    if op_pos_ids is not None:
+                                        op_dpo_tensors["chosen_position_ids"] = op_pos_ids[:offpolicy_n]
+                                        op_dpo_tensors["rejected_position_ids"] = op_pos_ids[offpolicy_n:]
+
+                                    offpolicy_dpo_proto = DataProto.from_dict(tensors=op_dpo_tensors)
+                                    print(f"  [Step {self.global_steps}] Off-policy DPO batch ready: "
+                                          f"{offpolicy_n} pairs", flush=True)
+
+                                except Exception as op_e:
+                                    print(f"ERROR in off-policy processing at step {self.global_steps}: {op_e}")
+                                    traceback.print_exc()
+                                    offpolicy_dpo_proto = None
+
+                        # --- Merge on-policy and off-policy DPO batches ---
+                        if dpo_update_batch_proto is not None and offpolicy_dpo_proto is not None:
+                            merged_tensors = {}
+                            for key in dpo_update_batch_proto.batch.keys():
+                                if key in offpolicy_dpo_proto.batch:
+                                    on_t = dpo_update_batch_proto.batch[key]
+                                    off_t = offpolicy_dpo_proto.batch[key]
+                                    if on_t.shape[1:] == off_t.shape[1:]:
+                                        merged_tensors[key] = torch.cat([on_t, off_t], dim=0)
+                                    else:
+                                        max_len = max(on_t.shape[1], off_t.shape[1])
+                                        pad_val = -100 if "labels" in key else 0
+                                        on_padded = torch.nn.functional.pad(
+                                            on_t, (0, max_len - on_t.shape[1]), value=pad_val
+                                        )
+                                        off_padded = torch.nn.functional.pad(
+                                            off_t, (0, max_len - off_t.shape[1]), value=pad_val
+                                        )
+                                        merged_tensors[key] = torch.cat([on_padded, off_padded], dim=0)
+                                else:
+                                    merged_tensors[key] = dpo_update_batch_proto.batch[key]
+
+                            dpo_meta = dpo_update_batch_proto.meta_info.copy()
+                            if "global_token_num" in dpo_meta and "global_token_num" not in offpolicy_dpo_proto.meta_info:
+                                off_tok_num = merged_tensors.get("chosen_attention_mask", merged_tensors.get("rejected_attention_mask"))
+                                if off_tok_num is not None:
+                                    pass
+                            dpo_update_batch_proto = DataProto.from_dict(tensors=merged_tensors, meta_info=dpo_meta)
+
+                            on_n = num_prompts
+                            off_n = offpolicy_dpo_proto.batch["chosen_input_ids"].shape[0]
+                            print(f"  [Step {self.global_steps}] Merged DPO batch: {on_n} on-policy + "
+                                  f"{off_n} off-policy = {on_n + off_n} total pairs", flush=True)
+                        elif dpo_update_batch_proto is None and offpolicy_dpo_proto is not None:
+                            dpo_update_batch_proto = offpolicy_dpo_proto
+                            dpo_meta = {
+                                "dpo_beta": OmegaConf.select(self.config.algorithm, "dpo_beta", default=0.1),
+                                "dpo_loss_type": OmegaConf.select(
+                                    self.config.algorithm, "dpo_loss_type", default="sigmoid"
+                                ),
+                                "dpo_label_smoothing": OmegaConf.select(
+                                    self.config.algorithm, "dpo_label_smoothing", default=0.0
+                                ),
+                                "length_normalize": OmegaConf.select(
+                                    self.config.algorithm, "length_normalize", default=False
+                                ),
+                                "use_reference_policy": self.use_reference_policy,
+                                "reference_free": not self.use_reference_policy,
+                                "global_step": self.global_steps,
+                            }
+                            dpo_update_batch_proto.meta_info.update(dpo_meta)
+                            print(f"  [Step {self.global_steps}] Using off-policy DPO batch only "
+                                  f"(on-policy failed)", flush=True)
+
                         # --- Actor Update Step ---
                         actor_output = None
                         if self.config.trainer.critic_warmup <= self.global_steps and dpo_update_batch_proto:
@@ -1409,6 +1734,11 @@ class RaySPINTrainer:
                                   f"({timing_raw.get('update_actor', '?'):.1f}s)", flush=True)
                             if actor_output is not None and "metrics" in actor_output.meta_info:
                                 metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+
+                            with _timer("update_weights", timing_raw):
+                                self.checkpoint_manager.update_weights(self.global_steps)
+                            print(f"  [DBG step={self.global_steps}] <<< update_weights done "
+                                  f"({timing_raw.get('update_weights', '?'):.1f}s)", flush=True)
                         elif dpo_update_batch_proto is None:
                             print(
                                 f"Skipping actor update at step {self.global_steps} due to DPO batch preparation error."
@@ -1502,6 +1832,11 @@ class RaySPINTrainer:
                     self.train_dataloader.reset()
                 except Exception as e:
                     print(f"Warning: Failed to reset train dataloader state: {e}")
+            if self.offpolicy_dataloader is not None and hasattr(self.offpolicy_dataloader, "reset"):
+                try:
+                    self.offpolicy_dataloader.reset()
+                except Exception as e:
+                    print(f"Warning: Failed to reset off-policy dataloader state: {e}")
             if should_stop:
                 break
 

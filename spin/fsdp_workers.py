@@ -132,8 +132,9 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_ref:
+            ref_model_path = self.config.model.get("ref_path", self.config.model.path)
             self.ref_module_fsdp = self._build_model_optimizer(
-                model_path=self.config.model.path,
+                model_path=ref_model_path,
                 fsdp_config=self.config.ref.fsdp_config,
                 optim_config=None,
                 override_model_config=override_model_config,
@@ -303,6 +304,11 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
         return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights(self, global_steps: int = None):
+        await self.rollout_mode()
+        return True
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
