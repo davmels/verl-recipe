@@ -155,6 +155,13 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
         accumulated_metrics = defaultdict(list)
         metrics = {}  # Final metrics dict
 
+        # Per-sequence KL chunks; reduced after the loop for true mean/max/min.
+        # Lets us report KL without the trainer's separate policy forward pass.
+        kl_chosen_raw_chunks = []
+        kl_rejected_raw_chunks = []
+        kl_chosen_tok_chunks = []
+        kl_rejected_tok_chunks = []
+
         # --- Zero Gradients ---
         self.actor_optimizer.zero_grad(set_to_none=True)
 
@@ -249,6 +256,26 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
                     (logits > 0).float().mean().item()
                 )
 
+            # --- KL diagnostics: reuse the policy/ref logps already computed for
+            # the DPO loss, so the trainer needs no separate forward pass. ---
+            with torch.no_grad():
+                _chosen_tokens = (micro_batch_chosen_labels[..., 1:] != -100).sum(-1).clamp(min=1)
+                _rejected_tokens = (micro_batch_rejected_labels[..., 1:] != -100).sum(-1).clamp(min=1)
+                _kl_chosen = policy_chosen_logps.detach() - micro_ref_chosen_logps
+                _kl_rejected = policy_rejected_logps.detach() - micro_ref_rejected_logps
+                if length_normalize:
+                    # get_batch_logps returned per-token means -> already per-token KL
+                    kl_chosen_tok_chunks.append(_kl_chosen)
+                    kl_rejected_tok_chunks.append(_kl_rejected)
+                    kl_chosen_raw_chunks.append(_kl_chosen * _chosen_tokens)
+                    kl_rejected_raw_chunks.append(_kl_rejected * _rejected_tokens)
+                else:
+                    # get_batch_logps returned sequence sums -> raw (summed) KL
+                    kl_chosen_raw_chunks.append(_kl_chosen)
+                    kl_rejected_raw_chunks.append(_kl_rejected)
+                    kl_chosen_tok_chunks.append(_kl_chosen / _chosen_tokens)
+                    kl_rejected_tok_chunks.append(_kl_rejected / _rejected_tokens)
+
             # --- Backward Pass (outside autocast) ---
             # Check if loss requires grad before backward
             if scaled_loss.requires_grad:
@@ -271,6 +298,24 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
             for key, val_list in accumulated_metrics.items():
                 if val_list:
                     metrics[key.replace("_batch", "")] = np.mean(val_list)
+
+            # KL metrics, emitted under the same keys the trainer previously
+            # computed from a separate forward pass over the subset.
+            if kl_chosen_raw_chunks and kl_rejected_raw_chunks:
+                _kl_c_raw = torch.cat(kl_chosen_raw_chunks)
+                _kl_r_raw = torch.cat(kl_rejected_raw_chunks)
+                _kl_c_tok = torch.cat(kl_chosen_tok_chunks)
+                _kl_r_tok = torch.cat(kl_rejected_tok_chunks)
+                _kl_raw_all = torch.cat([_kl_c_raw, _kl_r_raw])
+                _kl_tok_all = torch.cat([_kl_c_tok, _kl_r_tok])
+                metrics["kl/policy_vs_ref_raw/mean"] = _kl_raw_all.mean().item()
+                metrics["kl/policy_vs_ref_raw/chosen"] = _kl_c_raw.mean().item()
+                metrics["kl/policy_vs_ref_raw/rejected"] = _kl_r_raw.mean().item()
+                metrics["kl/policy_vs_ref/mean"] = _kl_tok_all.mean().item()
+                metrics["kl/policy_vs_ref/max"] = _kl_tok_all.max().item()
+                metrics["kl/policy_vs_ref/min"] = _kl_tok_all.min().item()
+                metrics["kl/chosen/mean"] = _kl_c_tok.mean().item()
+                metrics["kl/rejected/mean"] = _kl_r_tok.mean().item()
 
             # Calculate accuracy / rewards / margins based on averaged logprobs if desired
             if (

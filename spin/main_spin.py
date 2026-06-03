@@ -129,8 +129,11 @@ class TaskRunner:
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
+        # Optional separate tokenizer path (falls back to the model path when unset).
+        tokenizer_path = config.actor_rollout_ref.model.get("tokenizer_path", None)
+        tokenizer_local_path = copy_to_local(tokenizer_path) if tokenizer_path else local_path
+        tokenizer = hf_tokenizer(tokenizer_local_path, trust_remote_code=trust_remote_code)
+        processor = hf_processor(tokenizer_local_path, use_fast=True)  # used for multimodal LLM, could be none
 
         from verl.workers.reward_manager import get_reward_manager_cls
 

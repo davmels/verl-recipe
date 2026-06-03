@@ -24,6 +24,11 @@ algorithm:
   adv_estimator: null
 
 reward:
+  # >0 enables STREAMING annotation: the agent loop scores each trajectory via
+  # these reward-loop workers as it finishes generating (overlaps the judge with
+  # generation). 0 = synchronous post-hoc reward path (original behavior).
+  # Total judge concurrency ≈ num_workers * JUDGE_MAX_CONCURRENCY_PER_WORKER.
+  num_workers: 16
   custom_reward_function:
     path: pkg://recipe.spin.active_ultrafeedback_reward
     name: compute_score

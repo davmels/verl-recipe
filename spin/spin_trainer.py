@@ -853,10 +853,37 @@ class RaySPINTrainer:
         from verl.experimental.agent_loop import AgentLoopManager
 
         actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+
+        # Streaming annotation (approach A): when reward.num_workers > 0, build
+        # reward-loop workers and hand them to the agent loop so the judge scores
+        # each trajectory as it finishes generating (overlapping annotation with
+        # generation), instead of a separate post-hoc reward_fn(batch) pass.
+        # num_workers == 0 keeps the synchronous post-hoc reward path (fallback).
+        self.stream_annotation = (
+            int(OmegaConf.select(self.config, "reward.num_workers", default=0) or 0) > 0
+        )
+        reward_loop_worker_handles = None
+        if self.stream_annotation:
+            from verl.experimental.reward_loop import RewardLoopManager
+
+            # use_rm is False (judge-based reward), so reward computation can be
+            # parallelized with rollout; rm_resource_pool is unused without a RM.
+            self.reward_loop_manager = RewardLoopManager(
+                config=self.config,
+                rm_resource_pool=None,
+            )
+            reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers
+            print(
+                f"[SPIN] Streaming annotation ON: "
+                f"{len(reward_loop_worker_handles)} reward-loop workers.",
+                flush=True,
+            )
+
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rollout_resource_pool=actor_rollout_resource_pool,
+            reward_loop_worker_handles=reward_loop_worker_handles,
         )
         self.async_rollout_mode = True
 
@@ -1056,6 +1083,32 @@ class RaySPINTrainer:
 
         from verl.utils.tracking import Tracking
 
+        # Work around a wandb internal bug: on some server/SDK combos
+        # Server.query_with_timeout calls json.loads(flags) with flags=None,
+        # raising TypeError and aborting wandb.init(). Fall back to empty flags.
+        try:
+            import json as _json
+
+            from wandb.sdk.lib import server as _wandb_server
+
+            if not getattr(_wandb_server.Server.query_with_timeout, "_verl_patched", False):
+                _orig_qwt = _wandb_server.Server.query_with_timeout
+
+                def _patched_qwt(self):
+                    try:
+                        _orig_qwt(self)
+                    except TypeError:
+                        if getattr(self, "_viewer", None):
+                            flags = self._viewer.get("flags")
+                            self._flags = _json.loads(flags) if isinstance(flags, str) else {}
+                        else:
+                            self._flags = {}
+
+                _patched_qwt._verl_patched = True
+                _wandb_server.Server.query_with_timeout = _patched_qwt
+        except Exception as _patch_err:
+            print(f"Warning: could not apply wandb query_with_timeout patch: {_patch_err}")
+
         # Initialize logger
         logger = None
         try:
@@ -1066,7 +1119,10 @@ class RaySPINTrainer:
                 config=OmegaConf.to_container(self.config, resolve=True, throw_on_missing=False),
             )
         except Exception as e:
+            import traceback
+
             print(f"Warning: Failed to initialize logger: {e}")
+            traceback.print_exc()
 
         self.global_steps = 0
         # Load checkpoint before doing anything
@@ -1180,7 +1236,17 @@ class RaySPINTrainer:
                             pop_non_tensor_keys.append("raw_prompt")
                         if "multi_modal_inputs" in batch.non_tensor_batch.keys():
                             pop_non_tensor_keys.extend(["multi_modal_data", "multi_modal_inputs"])
-                        original_non_tensor_data = batch.non_tensor_batch
+                        # Streaming annotation scores each trajectory inside the agent
+                        # loop, so the reward-manager inputs must travel WITH gen_batch.
+                        # verl's naive.run_single needs data_source + reward_model
+                        # ["ground_truth"], plus extra_info for the judge prompt.
+                        if getattr(self, "stream_annotation", False):
+                            for _rk in ("data_source", "reward_model", "extra_info"):
+                                if _rk in batch.non_tensor_batch:
+                                    pop_non_tensor_keys.append(_rk)
+                        # Copy so the post-generation restore returns every original
+                        # field even if pop removes these in place.
+                        original_non_tensor_data = dict(batch.non_tensor_batch)
                         gen_batch = batch.pop(
                             batch_keys=pop_batch_keys,
                             non_tensor_batch_keys=pop_non_tensor_keys,
@@ -1253,28 +1319,40 @@ class RaySPINTrainer:
                               f"{truncated_prompt_count} prompts with all truncated", flush=True)
                         batch.non_tensor_batch["skip_reward_annotation"] = skip_annotation
 
-                        # --- Compute Rewards/Scores (needed to pick best/worst) ---
+                        # --- Rewards (needed to pick best/worst) ---
+                        # Streaming mode (reward.num_workers>0): the agent loop already
+                        # scored each trajectory DURING generation, so rm_scores rode
+                        # back on gen_batch_output and is now in batch via .union().
+                        # No separate judge pass here -> annotation overlapped gen.
                         print(f"  [DBG step={self.global_steps}] >>> ENTERING reward_calc", flush=True)
                         with _timer("reward_calc", timing_raw):
-                            if self.use_rm:
+                            reward_extra_infos_dict = {}
+                            if getattr(self, "stream_annotation", False):
+                                if "rm_scores" not in batch.batch:
+                                    raise RuntimeError(
+                                        "reward.num_workers>0 (streaming annotation) but the "
+                                        "rollout output has no 'rm_scores'. Check the agent-loop "
+                                        "reward wiring (reward_loop_worker_handles)."
+                                    )
+                                reward_tensor = batch.batch["rm_scores"]
+                            elif self.use_rm:
                                 reward_tensor_rm = self.rm_wg.compute_rm_score(batch)
                                 batch = batch.union(reward_tensor_rm)
-
-                            reward_extra_infos_dict = {}
-                            try:
-                                if self.reward_fn is None:
-                                    reward_tensor = batch.batch.get(
-                                        "rm_scores", torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
-                                    )
-                                else:
-                                    reward_result = self.reward_fn(batch, return_dict=True)
-                                    reward_tensor = reward_result["reward_tensor"]
-                                    reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
-
-                            except Exception:
-                                traceback.print_exc()
-                                reward_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
-                                reward_extra_infos_dict = {}
+                                reward_tensor = batch.batch["rm_scores"]
+                            else:
+                                try:
+                                    if self.reward_fn is None:
+                                        reward_tensor = batch.batch.get(
+                                            "rm_scores", torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
+                                        )
+                                    else:
+                                        reward_result = self.reward_fn(batch, return_dict=True)
+                                        reward_tensor = reward_result["reward_tensor"]
+                                        reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
+                                except Exception:
+                                    traceback.print_exc()
+                                    reward_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
+                                    reward_extra_infos_dict = {}
 
                             batch.batch["token_level_rewards"] = reward_tensor
                             if reward_extra_infos_dict:
@@ -1387,15 +1465,11 @@ class RaySPINTrainer:
                             subset_batch.batch["attention_mask"], dim=-1
                         ).tolist()
 
-                        # --- Compute policy log probs on subset only ---
-                        print(f"  [DBG step={self.global_steps}] >>> ENTERING policy_log_prob "
-                              f"(subset size={subset_batch.batch['input_ids'].shape[0]})", flush=True)
-                        with _timer("policy_log_prob", timing_raw):
-                            policy_log_prob_output = self.actor_rollout_wg.compute_log_prob(subset_batch)
-                            subset_batch = subset_batch.union(policy_log_prob_output)
-
-                        print(f"  [DBG step={self.global_steps}] <<< policy_log_prob done "
-                              f"({timing_raw.get('policy_log_prob', '?'):.1f}s)", flush=True)
+                        # --- Policy log probs are intentionally NOT computed here. ---
+                        # The DPO actor update recomputes policy logps with grad, and
+                        # KL diagnostics are derived there from those same logps. A
+                        # separate pre-update compute_log_prob over the subset would be
+                        # a redundant forward pass (see dp_actor.update_policy_dpo_with_ref).
 
                         # --- Compute ref log probs on subset only ---
                         if self.use_reference_policy:
@@ -1419,29 +1493,10 @@ class RaySPINTrainer:
                                 "is False."
                             )
 
-                        # --- Compute KL divergence between policy and ref on subset ---
-                        if (
-                            ref_log_prob_computed
-                            and "old_log_probs" in subset_batch.batch
-                            and "ref_log_prob" in subset_batch.batch
-                            and subset_batch.batch["old_log_probs"] is not None
-                            and subset_batch.batch["ref_log_prob"] is not None
-                        ):
-                            _resp_mask = subset_batch.batch["response_mask"]
-                            _kl = subset_batch.batch["old_log_probs"] - subset_batch.batch["ref_log_prob"]
-                            _kl_masked = _kl * _resp_mask
-                            _kl_raw_per_seq = _kl_masked.sum(-1)
-                            _kl_per_seq = _kl_raw_per_seq / _resp_mask.sum(-1).clamp(min=1)
-                            # raw (sequence-level, not normalized by length)
-                            metrics["kl/policy_vs_ref_raw/mean"] = torch.mean(_kl_raw_per_seq).item()
-                            metrics["kl/policy_vs_ref_raw/chosen"] = torch.mean(_kl_raw_per_seq[:num_prompts]).item()
-                            metrics["kl/policy_vs_ref_raw/rejected"] = torch.mean(_kl_raw_per_seq[num_prompts:]).item()
-                            # per-token (normalized by response length)
-                            metrics["kl/policy_vs_ref/mean"] = torch.mean(_kl_per_seq).item()
-                            metrics["kl/policy_vs_ref/max"] = torch.max(_kl_per_seq).item()
-                            metrics["kl/policy_vs_ref/min"] = torch.min(_kl_per_seq).item()
-                            metrics["kl/chosen/mean"] = torch.mean(_kl_per_seq[:num_prompts]).item()
-                            metrics["kl/rejected/mean"] = torch.mean(_kl_per_seq[num_prompts:]).item()
+                        # --- KL divergence is computed inside the actor update
+                        # (update_actor_dpo) from the same policy/ref logps used for
+                        # the DPO loss, and merged into `metrics` via
+                        # actor_output.meta_info["metrics"] below. No forward pass here. ---
 
                         # --- Prepare DPO Batch ---
                         # subset_batch is ordered as [chosen_0..chosen_N, rejected_0..rejected_N]
@@ -1590,10 +1645,11 @@ class RaySPINTrainer:
                                             self.config.actor_rollout_ref.actor.get("max_token_len", 0)
                                         )
 
-                                    print(f"  [Step {self.global_steps}] Off-policy: computing policy log-probs "
-                                          f"({offpolicy_pairs.batch['input_ids'].shape})", flush=True)
-                                    offpolicy_logprob_out = self.actor_rollout_wg.compute_log_prob(offpolicy_pairs)
-                                    offpolicy_pairs = offpolicy_pairs.union(offpolicy_logprob_out)
+                                    # Policy log-probs are intentionally NOT computed
+                                    # here: their output (old_log_probs) was unused, and
+                                    # the DPO update recomputes policy logps with grad
+                                    # (and KL) from the merged batch. Only ref log-probs
+                                    # are needed below.
 
                                     if self.use_reference_policy:
                                         print(f"  [Step {self.global_steps}] Off-policy: computing ref log-probs",
