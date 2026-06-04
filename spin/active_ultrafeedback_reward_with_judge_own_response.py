@@ -111,6 +111,8 @@ async def _judge_aspect(
     judge_own_response: str | None = None, 
     semaphore: asyncio.Semaphore | None = None,
 ) -> dict[str, float]:
+    if not isinstance(judge_own_response, str) or not judge_own_response.strip():
+        raise ValueError("judge_own_response must be a nonempty string")
     user_prompt = ASPECT2ANNOTATION_PROMPT[aspect].format(prompt=formatted_input, judge_own_response=judge_own_response, completion=completion)
     if judge_own_response is None:
         system_prompt = PREFERENCE_ANNOTATION_SYSTEM_PROMPT
@@ -302,6 +304,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
 
     if extra_info is None or "prompt" not in extra_info:
         raise ValueError("active_ultrafeedback_reward requires extra_info['prompt']")
+    if "judge_own_response" not in extra_info:
+        raise ValueError("active_ultrafeedback_reward requires extra_info['judge_own_response']")
 
     # Look up precomputed result by position
     pos = _PRECOMPUTED.get("_position_counter", None)
