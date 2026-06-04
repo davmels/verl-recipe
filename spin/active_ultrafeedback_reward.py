@@ -38,11 +38,33 @@ HONESTY_ANNOTATION_PROMPT = _prompts.HONESTY_ANNOTATION_PROMPT
 TRUTHFULNESS_ANNOTATION_PROMPT = _prompts.TRUTHFULNESS_ANNOTATION_PROMPT
 HELPFULNESS_ANNOTATION_PROMPT = _prompts.HELPFULNESS_ANNOTATION_PROMPT
 
+PREFERENCE_ANNOTATION_AGAINST_JUDGE_OWN_RESPONSE_SYSTEM_PROMPT = """You are an impartial judge. Your role is to critically evaluate the quality of an AI assistant response based on a given criteria. You'll receive an input with three sections, enclosed in tags: <USER_INPUT>...</USER_INPUT> for the task instructions (and any accompanying context, if applicable), <JUDGE_OWN_RESPONSE>...</JUDGE_OWN_RESPONSE> for the answer you once gave to the user prompt, and <ASSISTANT_RESPONSE_TO_EVALUATE>...</ASSISTANT_RESPONSE_TO_EVALUATE> for the AI assistant's response. 
+
+Carefully read the provided input to understand the task, then assess how well the response fulfills the criteria requirements. If conversation history is present, ensure the response aligns with it; otherwise, evaluate based solely on the instruction. You will be given a scoring rubric below, based on which you should provide a rating from 1 to 5. Your output should only be an integer from 1 to 5. Do not output any additional text or explanations."""
+
+AGAINST_JUDGE_OWN_RESPONSE_ANNOTATION_PROMPT = """You will be evaluating the quality of an assistant's response to a user prompt.
+
+Below is a scoring rubric from 1 to 5:
+1. The response is very poor
+2. The response is poor
+3. The response is acceptable
+4. The response is good
+5. The response is excellent
+
+Your output should only be an integer from 1 to 5. Do not output any additional text or explanations.
+
+<USER_INPUT>{prompt}</USER_INPUT>
+
+<JUDGE_OWN_RESPONSE>{judge_own_response}</JUDGE_OWN_RESPONSE>
+
+<ASSISTANT_RESPONSE_TO_EVALUATE>{completion}</ASSISTANT_RESPONSE_TO_EVALUATE>"""
+
 ASPECT2ANNOTATION_PROMPT = {
     # "instruction_following": INSTRUCTION_FOLLOWING_ANNOTATION_PROMPT,
     # "honesty": HONESTY_ANNOTATION_PROMPT,
     # "truthfulness": TRUTHFULNESS_ANNOTATION_PROMPT,
-    "helpfulness": HELPFULNESS_ANNOTATION_PROMPT,
+    # "helpfulness": HELPFULNESS_ANNOTATION_PROMPT,
+    "judge_own_response": AGAINST_JUDGE_OWN_RESPONSE_ANNOTATION_PROMPT,
 }
 
 TARGET_TOKENS = ["1", "2", "3", "4", "5"]
@@ -86,11 +108,16 @@ def _extract_probabilities(res) -> dict[str, float]:
 
 async def _judge_aspect(
     client: AsyncOpenAI, model: str, aspect: str, formatted_input: str, completion: str, call_id: int,
+    judge_own_response: str | None = None, 
     semaphore: asyncio.Semaphore | None = None,
 ) -> dict[str, float]:
-    user_prompt = ASPECT2ANNOTATION_PROMPT[aspect].format(prompt=formatted_input, completion=completion)
+    user_prompt = ASPECT2ANNOTATION_PROMPT[aspect].format(prompt=formatted_input, judge_own_response=judge_own_response, completion=completion)
+    if judge_own_response is None:
+        system_prompt = PREFERENCE_ANNOTATION_SYSTEM_PROMPT
+    else:
+        system_prompt = PREFERENCE_ANNOTATION_AGAINST_JUDGE_OWN_RESPONSE_SYSTEM_PROMPT
     messages = [
-        {"role": "system", "content": PREFERENCE_ANNOTATION_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     t0 = time.monotonic()
@@ -302,7 +329,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
         async with httpx.AsyncClient(timeout=timeout) as http_client:
             client = AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
             tasks = [
-                _judge_aspect(client, model, aspect, formatted_input, solution_str, call_id)
+                _judge_aspect(client, model, aspect, formatted_input, solution_str, call_id, extra_info.get("judge_own_response"))
                 for aspect in ASPECT2ANNOTATION_PROMPT
             ]
             results = await asyncio.gather(*tasks)
