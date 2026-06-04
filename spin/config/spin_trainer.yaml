@@ -30,7 +30,7 @@ reward:
   # Total judge concurrency ≈ num_workers * JUDGE_MAX_CONCURRENCY_PER_WORKER.
   num_workers: 16
   custom_reward_function:
-    path: pkg://recipe.spin.active_ultrafeedback_reward
+    path: pkg://recipe.spin.active_ultrafeedback_reward_with_judge_own_response
     name: compute_score
 
 trainer:
