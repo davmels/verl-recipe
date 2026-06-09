@@ -1,5 +1,4 @@
 import asyncio
-import importlib.util
 import itertools
 import math
 import os
@@ -8,11 +7,19 @@ import time
 import httpx
 from openai import AsyncOpenAI
 
+from recipe.spin.active_ultrafeedback_prompts import (
+    HELPFULNESS_ANNOTATION_PROMPT,
+    HONESTY_ANNOTATION_PROMPT,
+    INSTRUCTION_FOLLOWING_ANNOTATION_PROMPT,
+    PREFERENCE_ANNOTATION_SYSTEM_PROMPT,
+    TRUTHFULNESS_ANNOTATION_PROMPT,
+)
+
 _CALL_COUNTER = itertools.count()
 _STATS = {"started": 0, "finished": 0, "first_start": None}
 _BATCH = {"idx": 0}
 
-_LOG_DIR = "/iopsstor/scratch/cscs/dmelikidze/verl-training/logs"
+_LOG_DIR = os.path.join(os.environ.get("SCRATCH", os.getcwd()), "verl-training", "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _JOB_ID = os.environ.get("SLURM_JOB_ID", "nojob")
 _LOG_FILE = open(os.path.join(_LOG_DIR, f"reward_job{_JOB_ID}_pid{os.getpid()}.log"), "a", buffering=1)
@@ -26,17 +33,6 @@ def _log(msg: str) -> None:
     _LOG_FILE.write(line)
     _LOG_FILE.flush()
 
-
-_PROMPTS_PATH = "/iopsstor/scratch/cscs/dmelikidze/posttraining-data/response_annotation/prompts.py"
-_spec = importlib.util.spec_from_file_location("active_ultrafeedback_prompts", _PROMPTS_PATH)
-_prompts = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_prompts)
-
-PREFERENCE_ANNOTATION_SYSTEM_PROMPT = _prompts.PREFERENCE_ANNOTATION_SYSTEM_PROMPT
-INSTRUCTION_FOLLOWING_ANNOTATION_PROMPT = _prompts.INSTRUCTION_FOLLOWING_ANNOTATION_PROMPT
-HONESTY_ANNOTATION_PROMPT = _prompts.HONESTY_ANNOTATION_PROMPT
-TRUTHFULNESS_ANNOTATION_PROMPT = _prompts.TRUTHFULNESS_ANNOTATION_PROMPT
-HELPFULNESS_ANNOTATION_PROMPT = _prompts.HELPFULNESS_ANNOTATION_PROMPT
 
 ASPECT2ANNOTATION_PROMPT = {
     # "instruction_following": INSTRUCTION_FOLLOWING_ANNOTATION_PROMPT,

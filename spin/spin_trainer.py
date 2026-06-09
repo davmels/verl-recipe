@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Optional
 
-_PAIRS_LOG_DIR = "/iopsstor/scratch/cscs/dmelikidze/verl-training/logs"
+_PAIRS_LOG_DIR = os.path.join(os.environ.get("SCRATCH", os.getcwd()), "verl-training", "logs")
 os.makedirs(_PAIRS_LOG_DIR, exist_ok=True)
 _PAIRS_JOB_ID = os.environ.get("SLURM_JOB_ID", "nojob")
 _PAIRS_LOG_FILE = open(
