@@ -38,18 +38,18 @@ HONESTY_ANNOTATION_PROMPT = _prompts.HONESTY_ANNOTATION_PROMPT
 TRUTHFULNESS_ANNOTATION_PROMPT = _prompts.TRUTHFULNESS_ANNOTATION_PROMPT
 HELPFULNESS_ANNOTATION_PROMPT = _prompts.HELPFULNESS_ANNOTATION_PROMPT
 
-PREFERENCE_ANNOTATION_AGAINST_JUDGE_OWN_RESPONSE_SYSTEM_PROMPT = """You are an impartial judge. Your role is to critically evaluate the quality of an AI assistant response based on a given criteria. You'll receive an input with three sections, enclosed in tags: <USER_INPUT>...</USER_INPUT> for the task instructions (and any accompanying context, if applicable), <JUDGE_OWN_RESPONSE>...</JUDGE_OWN_RESPONSE> for the answer you once gave to the user prompt, and <ASSISTANT_RESPONSE_TO_EVALUATE>...</ASSISTANT_RESPONSE_TO_EVALUATE> for the AI assistant's response. 
+PREFERENCE_ANNOTATION_AGAINST_JUDGE_OWN_RESPONSE_SYSTEM_PROMPT = """You are an impartial judge. Your role is to critically evaluate the quality of an AI assistant response by directly comparing it against a reference response. You'll receive an input with three sections, enclosed in tags: <USER_INPUT>...</USER_INPUT> for the task instructions (and any accompanying context, if applicable), <JUDGE_OWN_RESPONSE>...</JUDGE_OWN_RESPONSE> for a reference answer you once gave to the user prompt, and <ASSISTANT_RESPONSE_TO_EVALUATE>...</ASSISTANT_RESPONSE_TO_EVALUATE> for the AI assistant's response.
 
-Carefully read the provided input to understand the task, then assess how well the response fulfills the criteria requirements. If conversation history is present, ensure the response aligns with it; otherwise, evaluate based solely on the instruction. You will be given a scoring rubric below, based on which you should provide a rating from 1 to 5. Your output should only be an integer from 1 to 5. Do not output any additional text or explanations."""
+Carefully read the provided input to understand the task, then directly compare the assistant's response against your own reference response to judge which is better. If conversation history is present, ensure the response aligns with it; otherwise, evaluate based solely on the instruction. You will be given a scoring rubric below, based on which you should provide a rating from 1 to 5 that reflects how the assistant's response compares to your reference response. Your output should only be an integer from 1 to 5. Do not output any additional text or explanations."""
 
-AGAINST_JUDGE_OWN_RESPONSE_ANNOTATION_PROMPT = """You will be evaluating the quality of an assistant's response to a user prompt.
+AGAINST_JUDGE_OWN_RESPONSE_ANNOTATION_PROMPT = """You will be evaluating the quality of an assistant's response to a user prompt by comparing it against a reference response.
 
-Below is a scoring rubric from 1 to 5:
-1. The response is very poor
-2. The response is poor
-3. The response is acceptable
-4. The response is good
-5. The response is excellent
+Below is a scoring rubric from 1 to 5, describing how the assistant's response compares to the reference response:
+1. Much worse than the reference response
+2. Somewhat worse than the reference response
+3. About the same quality as the reference response
+4. Somewhat better than the reference response
+5. Much better than the reference response
 
 Your output should only be an integer from 1 to 5. Do not output any additional text or explanations.
 
