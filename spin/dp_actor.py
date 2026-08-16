@@ -67,7 +67,15 @@ class SPINDataParallelPPOActor(DataParallelPPOActor):
         elif use_dynamic_bsz:
             # split using dynamic bsz
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            # Fix A: pass dp_group so rearrange_micro_batches all-reduces the micro-batch
+            # COUNT to the max across the DP group (same_micro_num_in_dp=True). Without it,
+            # uneven per-rank counts desync the per-forward FSDP all-gathers -> NCCL watchdog
+            # kills a rank (the ~673s ref_log_prob crash). SP=1 here so the DP group is WORLD;
+            # get_reverse_idx below still restores the original sample order, values unchanged.
+            dp_group = torch.distributed.group.WORLD if torch.distributed.is_initialized() else None
+            micro_batches, indices = rearrange_micro_batches(
+                batch=batch, max_token_len=max_token_len, dp_group=dp_group
+            )
         else:
             micro_batches = batch.split(micro_batch_size)
 

@@ -89,7 +89,15 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
         use_remove_padding = self.config.model.get("use_remove_padding", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
 
-        if self._is_actor or self._is_rollout or self._is_ref:
+        # skip_redundant_actor_build (LARGE_MODEL): a ref-only worker (ref, but not
+        # actor/rollout) otherwise builds a full SECOND model + Adam optimizer via the
+        # role="actor" path below that it never uses -> ~2x host RAM at rank-0 load
+        # (sync_module_states) -> Ray OOM for 70B. Skip it; the ref uses only
+        # self.ref_policy / ref_module_fsdp built under `if self._is_ref` below.
+        _ref_only = self._is_ref and not self._is_actor and not self._is_rollout
+        _skip_actor_build = _ref_only and bool(self.config.ref.get("skip_redundant_actor_build", False))
+
+        if (self._is_actor or self._is_rollout or self._is_ref) and not _skip_actor_build:
             # we need the model for actor and rollout
             if self._is_actor or self._is_ref:
                 optim_config = self.config.actor.optim
@@ -119,7 +127,7 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
         # load from checkpoint
-        if self._is_actor or self._is_ref:
+        if (self._is_actor or self._is_ref) and not _skip_actor_build:
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
@@ -149,13 +157,17 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
-            self.checkpoint_manager = FSDPCheckpointManager(
-                model=self.actor_module_fsdp,
-                optimizer=self.actor.actor_optimizer,
-                lr_scheduler=self.actor_lr_scheduler,
-                processing_class=self.processor if self.processor is not None else self.tokenizer,
-                checkpoint_config=self.config.actor.checkpoint,
-            )
+            # This ref-worker checkpoint manager references the actor module and is never
+            # invoked by the trainer (checkpoints save via actor_rollout_wg). Skip it when
+            # the redundant actor build was skipped, else it would touch a missing module.
+            if not _skip_actor_build:
+                self.checkpoint_manager = FSDPCheckpointManager(
+                    model=self.actor_module_fsdp,
+                    optimizer=self.actor.actor_optimizer,
+                    lr_scheduler=self.actor_lr_scheduler,
+                    processing_class=self.processor if self.processor is not None else self.tokenizer,
+                    checkpoint_config=self.config.actor.checkpoint,
+                )
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
