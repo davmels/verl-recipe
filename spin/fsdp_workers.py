@@ -89,7 +89,15 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
         use_remove_padding = self.config.model.get("use_remove_padding", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
 
-        if self._is_actor or self._is_rollout or self._is_ref:
+        # skip_redundant_actor_build (LARGE_MODEL): a ref-only worker (ref, but not
+        # actor/rollout) otherwise builds a full SECOND model + Adam optimizer via the
+        # role="actor" path below that it never uses -> ~2x host RAM at rank-0 load
+        # (sync_module_states) -> Ray OOM for 70B. Skip it; the ref uses only
+        # self.ref_policy / ref_module_fsdp built under `if self._is_ref` below.
+        _ref_only = self._is_ref and not self._is_actor and not self._is_rollout
+        _skip_actor_build = _ref_only and bool(self.config.ref.get("skip_redundant_actor_build", False))
+
+        if (self._is_actor or self._is_rollout or self._is_ref) and not _skip_actor_build:
             # we need the model for actor and rollout
             if self._is_actor or self._is_ref:
                 optim_config = self.config.actor.optim
@@ -119,7 +127,7 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
         # load from checkpoint
-        if self._is_actor or self._is_ref:
+        if (self._is_actor or self._is_ref) and not _skip_actor_build:
             OmegaConf.set_struct(self.config.actor, True)
             with open_dict(self.config.actor):
                 self.config.actor.use_remove_padding = use_remove_padding
@@ -129,6 +137,15 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
             )
 
         if self._is_rollout:
+            # Release the PyTorch reserved-cache pinned by the FSDP build peak (~57GB
+            # reserved with ~0 allocated) BEFORE SGLang inits its KV pool. Without this,
+            # SGLang sees too little free GPU and its mem_fraction KV pool underflows ->
+            # "Not enough memory. increase mem_fraction_static" OOM at rollout init.
+            # (LARGE_MODEL/70B fix; harmless for small models.)
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_ref:
@@ -149,13 +166,24 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
-            self.checkpoint_manager = FSDPCheckpointManager(
-                model=self.actor_module_fsdp,
-                optimizer=self.actor.actor_optimizer,
-                lr_scheduler=self.actor_lr_scheduler,
-                processing_class=self.processor if self.processor is not None else self.tokenizer,
-                checkpoint_config=self.config.actor.checkpoint,
-            )
+            # NOTE: do NOT offload the ref to CPU here. The init-time host-RAM peak
+            # (ranks' staggered fp32 loads overlapping, ~428GB/450GB node budget) is the
+            # tightest window of the whole run; parking 2.3GB/rank of ref shards into
+            # host RAM during it OOM-killed ref_init_model (run 3102851). The ref stays
+            # on GPU until the first compute_ref_log_prob, whose exit offloads it — the
+            # host copy then lands well after the init peak has passed, and every
+            # subsequent actor update still gets the ~2.3GB/rank GPU benefit.
+            # This ref-worker checkpoint manager references the actor module and is never
+            # invoked by the trainer (checkpoints save via actor_rollout_wg). Skip it when
+            # the redundant actor build was skipped, else it would touch a missing module.
+            if not _skip_actor_build:
+                self.checkpoint_manager = FSDPCheckpointManager(
+                    model=self.actor_module_fsdp,
+                    optimizer=self.actor.actor_optimizer,
+                    lr_scheduler=self.actor_lr_scheduler,
+                    processing_class=self.processor if self.processor is not None else self.tokenizer,
+                    checkpoint_config=self.config.actor.checkpoint,
+                )
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -188,6 +216,14 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 
+        # Ref param offload: for a ref-role worker, self._is_offload_param comes from
+        # ref.fsdp_config.param_offload (verl fsdp_workers __init__). The ref's fp32
+        # shards (~2.3GB/rank at FSDP=128 for 70B) are only needed HERE, so page them
+        # in for the pass and back out after — otherwise they sit on GPU as dead weight
+        # during the actor DPO update, which runs within ~1GB of OOM.
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.ref_module_fsdp)
+
         # Support all hardwares
         data = data.to(get_device_id())
 
@@ -206,6 +242,13 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
         # unshard the root FSDP module
         if self.world_size > 1 and self.ref_policy.actor_module._handle.uses_sharded_strategy:
             self.ref_policy.actor_module._handle.reshard(True)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.ref_module_fsdp)
+        # Return the ref pass's allocator blocks to the driver so the actor update
+        # (which runs next on this same GPU) re-reserves from a clean pool instead of
+        # inheriting this pass's fragmentation.
+        torch.cuda.empty_cache()
 
         return output
 
@@ -302,6 +345,11 @@ class SPINRolloutRefWorker(ActorRolloutRefWorker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+        # Hand the update's transients back to the driver before update_weights resumes
+        # SGLang (cu_mem_create there allocates at driver level and cannot reuse blocks
+        # cached inside PyTorch's allocator).
+        torch.cuda.empty_cache()
 
         return output
 

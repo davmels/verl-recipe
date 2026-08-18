@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Any, Optional
 
-_PAIRS_LOG_DIR = "/iopsstor/scratch/cscs/dmelikidze/verl-training/logs"
+_PAIRS_LOG_DIR = os.path.join(os.environ.get("SCRATCH", os.getcwd()), "verl-training", "logs")
 os.makedirs(_PAIRS_LOG_DIR, exist_ok=True)
 _PAIRS_JOB_ID = os.environ.get("SLURM_JOB_ID", "nojob")
 _PAIRS_LOG_FILE = open(
@@ -928,20 +928,40 @@ class RaySPINTrainer:
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
-        self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
-        )
+        # Put SGLang to sleep before the save's full-model gather. At save time SGLang is
+        # AWAKE (~53GB weights+KV, resumed by the update_weights that ends the training
+        # step), and save_checkpoint's FSDP all-gather of the full model (~16GB) does not
+        # fit alongside it -> "Tried to allocate 16.28GiB, 15.53 free" (missed by <1GB).
+        # sleep_replicas() releases weights+kv_cache, giving the gather room.
+        self.checkpoint_manager.sleep_replicas()
+        try:
+            self.actor_rollout_wg.save_checkpoint(
+                actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            )
 
-        if self.use_critic:
-            critic_local_path = os.path.join(local_global_step_folder, "critic")
-            critic_remote_path = (
-                None
-                if self.config.trainer.default_hdfs_dir is None
-                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
-            )
-            self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
-            )
+            if self.use_critic:
+                critic_local_path = os.path.join(local_global_step_folder, "critic")
+                critic_remote_path = (
+                    None
+                    if self.config.trainer.default_hdfs_dir is None
+                    else os.path.join(
+                        self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic"
+                    )
+                )
+                self.critic_wg.save_checkpoint(
+                    critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+                )
+        finally:
+            # Wake SGLang back up. This MUST be update_weights, NOT wake_up_replicas():
+            # in HYBRID (colocated) rollout SGLangHttpServer.wake_up() hard-raises
+            # ("wake_up not support rollout_mode HYBRID", async_sglang_server.py:327-329)
+            # because hybrid mode only ever resumes SGLang through update_weights.
+            # Re-syncing the (unchanged, post-update) actor weights restores exactly the
+            # awake+synced state the loop had right after the in-loop update_weights that
+            # preceded this save -- the state the next generation expects. In `finally` so
+            # a failed save cannot leave SGLang asleep and break the next step.
+            # Cost: one extra ~20s weight sync per save.
+            self.checkpoint_manager.update_weights(self.global_steps)
 
         # save dataloader
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
